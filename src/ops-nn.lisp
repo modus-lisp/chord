@@ -390,6 +390,44 @@ which the caller has already filled with the bias (or with zeros)."
           do (incf (aref dr (+ dst (* i stride))) (* weight (aref dx (+ src i))))))
   (values))
 
+;;; The scatter above is one output element per multiply and STRIDE elements
+;;; apart, which is the worst thing a vector unit can be handed.  It does not
+;;; have to be that way.  A single kernel position K reaches only the outputs
+;;; J = L*STRIDE + K - PAD, and every one of those has the same J mod STRIDE —
+;;; so a pass over the input for one K writes one residue class of the output
+;;; row, and it writes it in order, one element per input sample.
+;;;
+;;; De-interleave the row into its STRIDE classes and every pass becomes an
+;;; ordinary stride-1 CONV-AXPY: contiguous in, contiguous out, vectorizable.
+;;; Nothing about which terms are added, or in what order, changes — this is the
+;;; same loop over the same taps, writing to a permuted address — which is what
+;;; lets inspect/conv-gate.lisp keep comparing exactly.  The permutation costs
+;;; two passes over the row, against CGROUP-IN * KW passes of real work.
+(declaim (inline transpose-deinterleave transpose-interleave))
+(defun transpose-deinterleave (dr tmp orow out-len stride)
+  "TMP gets row OROW of DR, one residue class after another."
+  (declare (type (simple-array single-float (*)) dr tmp)
+           (type dim orow out-len stride) (optimize (speed 3) (safety 0)))
+  (let ((p 0))
+    (declare (type dim p))
+    (dotimes (r stride)
+      (loop for j of-type dim from r below out-len by stride
+            do (setf (aref tmp p) (aref dr (+ orow j)))
+               (incf p))))
+  (values))
+
+(defun transpose-interleave (dr tmp orow out-len stride)
+  "The inverse of TRANSPOSE-DEINTERLEAVE."
+  (declare (type (simple-array single-float (*)) dr tmp)
+           (type dim orow out-len stride) (optimize (speed 3) (safety 0)))
+  (let ((p 0))
+    (declare (type dim p))
+    (dotimes (r stride)
+      (loop for j of-type dim from r below out-len by stride
+            do (setf (aref dr (+ orow j)) (aref tmp p))
+               (incf p))))
+  (values))
+
 (defun conv-transpose1d-core (dx dw dr row-lo row-hi cin len cout cgroup-in
                               cgroup-out kw out-len stride dilation pad-begin)
   "Scatter DX through DW into rows [ROW-LO, ROW-HI) of DR, which the caller has
@@ -400,10 +438,23 @@ already filled with the bias (or with zeros).  Note the weight layout:
                  stride dilation)
            (type (signed-byte 30) pad-begin)
            (optimize (speed 3) (safety 0)))
-  (let ((xplane (* cin len))
-        (oplane (* cout out-len))
-        (wplane (* cgroup-out kw)))     ; elements per INPUT channel here
-    (declare (type dim xplane oplane wplane))
+  (let* ((xplane (* cin len))
+         (oplane (* cout out-len))
+         (wplane (* cgroup-out kw))     ; elements per INPUT channel here
+         ;; the de-interleaved path needs one scratch row, and a dilated kernel
+         ;; does not have the property it rests on (its taps skip residues)
+         (classes (= dilation 1))
+         (tmp (make-array (if classes out-len 0) :element-type 'single-float))
+         ;; where each residue class starts in TMP
+         (cstart (make-array (if classes stride 0) :element-type 'fixnum)))
+    (declare (type dim xplane oplane wplane)
+             (type (simple-array single-float (*)) tmp))
+    (when classes
+      (let ((p 0))
+        (declare (type dim p))
+        (dotimes (r stride)
+          (setf (aref cstart r) p)
+          (incf p (max 0 (ceiling (- out-len r) stride))))))
     (loop for row of-type dim from row-lo below row-hi do
       (multiple-value-bind (nb ochan) (floor row cout)
         (declare (type dim nb ochan))
@@ -413,6 +464,7 @@ already filled with the bias (or with zeros).  Note the weight layout:
                 (orow (+ (* nb oplane) (* ochan out-len)))
                 (wcol (* m kw)))
             (declare (type dim xbase orow wcol))
+            (when classes (transpose-deinterleave dr tmp orow out-len stride))
             (dotimes (ci cgroup-in)
               (declare (type dim ci))
               (let* ((c (+ (* g cgroup-in) ci))
@@ -427,15 +479,26 @@ already filled with the bias (or with zeros).  Note the weight layout:
                     (declare (type fixnum shift))
                     (unless (zerop weight)
                       (let ((lo (max 0 (ceiling (- shift) stride)))
-                            (hi (max 0 (min len (ceiling (- out-len shift) stride)))))
+                            (hi (max 0 (min len (ceiling (- out-len shift)
+                                                         stride)))))
                         (declare (type dim lo hi))
                         ;; LO was solved for exactly the point where the output
                         ;; tap stops being negative
                         (when (< lo hi)
-                          (conv-scatter dr dx weight
-                                        (+ orow shift (* lo stride))
-                                        (+ xrow lo)
-                                        (- hi lo) stride)))))))))))))
+                          (if classes
+                              ;; this tap owns residue class SHIFT mod STRIDE,
+                              ;; and input sample l is its element l + SHIFT div
+                              ;; STRIDE — so the same pass, written contiguously
+                              (conv-axpy tmp dx weight
+                                         (the dim (+ (aref cstart
+                                                           (mod shift stride))
+                                                     lo (floor shift stride)))
+                                         (+ xrow lo) (- hi lo) 1)
+                              (conv-scatter dr dx weight
+                                            (+ orow shift (* lo stride))
+                                            (+ xrow lo)
+                                            (- hi lo) stride)))))))))
+            (when classes (transpose-interleave dr tmp orow out-len stride)))))))
   (values))
 
 (defop "ConvTranspose" (node ins)

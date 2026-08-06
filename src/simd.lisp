@@ -90,7 +90,13 @@ The F32V-DONE sits between them because the remainder is scalar code, and so is
 whatever called this; see the note at the top of this file for what it costs to
 leave it out.  It is unconditional rather than inside the loop: a caller may have
 broadcast a vector before getting here even when N is short enough that the
-vector loop never runs, and that alone is enough to dirty the state."
+vector loop never runs, and that alone is enough to dirty the state.
+
+Hoisting it out of a hot caller is a trap worth naming, because it looks like a
+saving: reading one element of a float array is itself legacy SSE, so a loop
+that reads a scalar, broadcasts it and vectorizes pays the transition every pass
+unless the fence is inside.  Measured on ConvTranspose, hoisting it made that op
+ten times slower than the scalar code it replaced."
   (let ((end (gensym "END")))
     `(let ((,end (- ,n (mod ,n +f32-lanes+))))
        (declare (type dim ,end))
