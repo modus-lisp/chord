@@ -25,9 +25,18 @@ three that cannot be compared are the two Gaussian draws and the one multiply
 between a draw and its noise-scale gate; the gate names them rather than skipping
 them quietly. The finished waveform differs from onnxruntime's by at most 5.3e-5
 — below the 3.05e-5 step of the 16-bit WAV it gets written to. It started at
-0.05x realtime and now runs **faster than realtime**: 0.30x on one thread, 1.31x
-on the default 16, 1.56x on 64 (`CHORD_THREADS` sets it). The per-node gate is
-what made it safe to go fast.
+0.05x realtime and now runs **faster than realtime**: 0.63x on one thread, 2.36x
+on the default 16, 2.76x on 64 (`CHORD_THREADS` sets it). Convolution is about
+half of what is left, and it is bandwidth-bound rather than arithmetic-bound —
+which is why it gets 6.2x out of 16 threads and only 8.6x out of 64.
+
+The per-node gate is what made it safe to go fast, and
+`inspect/conv-gate.lisp` is what makes it safe to have gone fast in the
+convolution kernel specifically: 11342 cases of Conv and ConvTranspose against
+the definition, over strides, dilations, padding and kernel widths this voice
+never uses, compared **exactly** rather than within a tolerance. Every
+optimization in that kernel claims to leave the summation order alone, so a
+tolerance would hide the only kind of mistake worth catching.
 
 *The front end.* English in, IPA out, in four stages: normalize the text, look
 the word up in [CMUdict](https://github.com/cmusphinx/cmudict), fall back to
