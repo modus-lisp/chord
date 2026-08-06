@@ -98,7 +98,7 @@ I mod SP[J1] minus I mod SP[J2].  Hence P = SP[J1]/SP[J2] and Q = SP[J2]."
 
 ;;; ---- binary ----------------------------------------------------------------
 
-(defmacro def-f32-cores (name (xa xb) form)
+(defmacro def-f32-cores (name (xa xb) form &optional vec-form)
   "Three typed float32 cores for one elementwise op, split out of the op the same
 way CONV1D-CORE is: (speed 3) (safety 0) with every index a DIM, while the op
 around them keeps normal safety for the shape checks.
@@ -112,28 +112,60 @@ FLAT is both operands walked by the output's own index — no broadcast at all,
 and no counters to carry.  SCALAR is that with a one-element right operand
 hoisted out of the loop, which is what Pow and the decoder's Divs are.  TILED is
 the general (P Q) form; its counters are seeded from LO rather than 0 so that a
-chunk starts reading where the whole loop would have."
+chunk starts reading where the whole loop would have.
+
+VEC-FORM, when the op has one, is FORM in the vector vocabulary of simd.lisp,
+and it vectorizes FLAT and SCALAR.  It is bit-for-bit FORM because a lane of a
+packed add, subtract, multiply or divide is the IEEE operation the scalar
+instruction does — the same rounding on the same two floats — and the lanes are
+independent, so nothing is reassociated.  TILED is left scalar on purpose: its
+two counters carry, which is sequential by construction, and it is the shape
+that shows up on small tensors where the transition fence would cost more than
+the loop."
   (let ((flat (intern (format nil "~:@(~a~)-FLAT-F32" name)))
         (scalar (intern (format nil "~:@(~a~)-SCALAR-F32" name)))
-        (tiled (intern (format nil "~:@(~a~)-TILED-F32" name))))
+        (tiled (intern (format nil "~:@(~a~)-TILED-F32" name)))
+        (n (gensym "N")) (iv (gensym "IV")) (is (gensym "IS")) (bv (gensym "BV")))
     `(progn
        (defun ,flat (da db dr lo hi)
          (declare (type f32v da db dr) (type dim lo hi)
                   (optimize (speed 3) (safety 0)))
-         (loop for i of-type dim from lo below hi
-               do (let ((,xa (aref da i)) (,xb (aref db i)))
-                    (declare (ignorable ,xa ,xb))
-                    (setf (aref dr i) ,form)))
+         ,(if vec-form
+              `(let ((,n (- hi lo)))
+                 (declare (type dim ,n))
+                 (do-vectorized (,iv ,is ,n)
+                   (let ((,xa (f32v-ref da (+ lo ,iv))) (,xb (f32v-ref db (+ lo ,iv))))
+                     (declare (ignorable ,xa ,xb))
+                     (setf (f32v-ref dr (+ lo ,iv)) ,vec-form))
+                   (let ((,xa (aref da (+ lo ,is))) (,xb (aref db (+ lo ,is))))
+                     (declare (ignorable ,xa ,xb))
+                     (setf (aref dr (+ lo ,is)) ,form))))
+              `(loop for i of-type dim from lo below hi
+                     do (let ((,xa (aref da i)) (,xb (aref db i)))
+                          (declare (ignorable ,xa ,xb))
+                          (setf (aref dr i) ,form))))
          (values))
        (defun ,scalar (da db dr lo hi)
          (declare (type f32v da db dr) (type dim lo hi)
                   (optimize (speed 3) (safety 0)))
-         (let ((,xb (aref db 0)))
-           (declare (ignorable ,xb))
-           (loop for i of-type dim from lo below hi
-                 do (let ((,xa (aref da i)))
-                      (declare (ignorable ,xa))
-                      (setf (aref dr i) ,form))))
+         ,(if vec-form
+              `(let* ((,xb (aref db 0))
+                      (,n (- hi lo))
+                      (,bv (f32v-broadcast ,xb)))
+                 (declare (ignorable ,xb ,bv) (type dim ,n))
+                 (do-vectorized (,iv ,is ,n)
+                   (let ((,xa (f32v-ref da (+ lo ,iv))) (,xb ,bv))
+                     (declare (ignorable ,xa ,xb))
+                     (setf (f32v-ref dr (+ lo ,iv)) ,vec-form))
+                   (let ((,xa (aref da (+ lo ,is))))
+                     (declare (ignorable ,xa))
+                     (setf (aref dr (+ lo ,is)) ,form))))
+              `(let ((,xb (aref db 0)))
+                 (declare (ignorable ,xb))
+                 (loop for i of-type dim from lo below hi
+                       do (let ((,xa (aref da i)))
+                            (declare (ignorable ,xa))
+                            (setf (aref dr i) ,form)))))
          (values))
        (defun ,tiled (da db dr lo hi pa qa pb qb)
          (declare (type f32v da db dr)
@@ -157,13 +189,16 @@ chunk starts reading where the whole loop would have."
                       (setf kb 0) (incf cb) (when (= cb pb) (setf cb 0)))))
          (values)))))
 
-(defmacro def-binop (name (xa xb) &key form int-form f32-form (out :same)
+(defmacro def-binop (name (xa xb) &key form int-form f32-form vec-form (out :same)
                                        (dtypes '(:f32 :f64 :i64 :i32))
                                        (grain '+flat-grain+))
   "Define an elementwise binary op.  FORM computes the result from XA and XB;
 INT-FORM replaces it for integer dtypes when the two differ (Div is the reason:
 ONNX integer division truncates), and F32-FORM replaces it for float32 when a
-cheaper expression is exact there (Pow is the reason).  OUT is :SAME or :BOOL.
+cheaper expression is exact there (Pow is the reason).  VEC-FORM is the float32
+expression in simd.lisp's vocabulary, for the ops that have one — see
+DEF-F32-CORES for which cores it reaches and why it changes no result.  OUT is
+:SAME or :BOOL.
 
 A :SAME op over float32 gets the typed cores and the worker pool; everything
 else keeps the general road below.  GRAIN is how many output elements are worth
@@ -204,7 +239,7 @@ waking a thread for, which the caller knows and PARALLEL-RANGE does not."
                             (setf (aref dr i) ,body)))))
                   res))))
       `(progn
-         ,@(when fastp `((def-f32-cores ,name (,xa ,xb) ,f32-body)))
+         ,@(when fastp `((def-f32-cores ,name (,xa ,xb) ,f32-body ,vec-form)))
          (defop ,name (node ins)
            (let* ((a (first ins)) (b (second ins))
                   (shape (broadcast-shapes (tensor-shape a) (tensor-shape b)))
@@ -272,10 +307,14 @@ negative bases all follow from that being a single rounding either way."
       (* b b)
       (float (pow-f b e) b)))
 
-(def-binop "Add" (x y) :form (+ x y) :dtypes (:f32 :f64 :i64 :i32))
-(def-binop "Sub" (x y) :form (- x y) :dtypes (:f32 :f64 :i64 :i32))
-(def-binop "Mul" (x y) :form (* x y) :dtypes (:f32 :f64 :i64 :i32))
-(def-binop "Div" (x y) :form (/ x y) :int-form (values (truncate x y))
+(def-binop "Add" (x y) :form (+ x y) :vec-form (f32v+ x y)
+                       :dtypes (:f32 :f64 :i64 :i32))
+(def-binop "Sub" (x y) :form (- x y) :vec-form (f32v- x y)
+                       :dtypes (:f32 :f64 :i64 :i32))
+(def-binop "Mul" (x y) :form (* x y) :vec-form (f32v* x y)
+                       :dtypes (:f32 :f64 :i64 :i32))
+(def-binop "Div" (x y) :form (/ x y) :vec-form (f32v/ x y)
+                       :int-form (values (truncate x y))
                        :dtypes (:f32 :f64 :i64 :i32) :grain +heavy-grain+)
 (def-binop "Pow" (x y) :form (float (pow-f x y) x) :f32-form (pow-f32 x y)
                        :int-form (expt x y)

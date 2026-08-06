@@ -4,12 +4,15 @@
 ;;;; about half of what scalar floating point can do on one core, which is where
 ;;;; scalar code stops.  The rest of the machine is a vector unit.
 ;;;;
-;;;; This file is deliberately five operations wide.  Everything below is spelled
-;;;; in terms of F32V-REF, F32V-BROADCAST, F32V+, F32V*, F32V-DONE and
-;;;; +F32-LANES+, and a port is those five plus a constant — which is the whole
+;;;; This file is deliberately narrow.  Everything below is spelled in terms of
+;;;; F32V-REF, F32V-BROADCAST, the four arithmetic operations, F32V-DONE and
+;;;; +F32-LANES+, and a port is those seven plus a constant — which is the whole
 ;;;; point, because the machine this engine is aimed at is a Raspberry Pi running
 ;;;; modus rather than SBCL, and its vector unit is NEON.  A kernel written
-;;;; against these five compiles unchanged there; only this file gets a third arm.
+;;;; against these compiles unchanged there; only this file gets a third arm.
+;;;; Every one of them is a single NEON instruction (vld1q/vdupq/vaddq/vsubq/
+;;;; vmulq/vdivq), which is the test a candidate for this list has to pass:
+;;;; nothing goes in here that a port would have to emulate.
 ;;;;
 ;;;; F32V-DONE is the one that is not arithmetic, and it is not decoration.  SBCL
 ;;;; compiles ordinary single-float code to legacy, non-VEX SSE.  On x86 a VEX
@@ -65,7 +68,9 @@ mean a copy per tap."
 
   (defmacro f32v-broadcast (x) `(sb-simd-avx2:f32.8 ,x))
   (defmacro f32v+ (a b) `(sb-simd-avx2:f32.8+ ,a ,b))
+  (defmacro f32v- (a b) `(sb-simd-avx2:f32.8- ,a ,b))
   (defmacro f32v* (a b) `(sb-simd-avx2:f32.8* ,a ,b))
+  (defmacro f32v/ (a b) `(sb-simd-avx2:f32.8/ ,a ,b))
   (defmacro f32v-done () `(sb-simd-avx2:vzeroupper)))
 
 #-chord-avx2
@@ -75,7 +80,9 @@ mean a copy per tap."
   (defmacro f32v-ref (a i) `(aref (the (simple-array single-float (*)) ,a) ,i))
   (defmacro f32v-broadcast (x) `(the single-float ,x))
   (defmacro f32v+ (a b) `(+ ,a ,b))
+  (defmacro f32v- (a b) `(- ,a ,b))
   (defmacro f32v* (a b) `(* ,a ,b))
+  (defmacro f32v/ (a b) `(/ ,a ,b))
   (defmacro f32v-done () nil))
 
 (defmacro do-vectorized ((iv is n) vector-body scalar-body)
