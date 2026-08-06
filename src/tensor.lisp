@@ -136,6 +136,18 @@ generic loop over an array of unknown type."
                         (t (make-array n :element-type et
                                          :initial-element value))))))
 
+(defun make-tensor-unfilled (dtype shape)
+  "A new tensor of DTYPE whose data has NOT been zeroed.  Only for kernels that
+assign every element of it — anything that accumulates still needs MAKE-TENSOR.
+A recycled vector holds the last owner's numbers and a fresh one holds whatever
+the pages held, so a caller that skips an element leaks a value from elsewhere in
+the graph rather than reading a nice diagnosable zero."
+  (let* ((shape (coerce shape 'simple-vector))
+         (n (shape-size shape)))
+    (%make-tensor dtype shape
+                  (or (pool-take dtype n)
+                      (make-array n :element-type (dtype-element-type dtype))))))
+
 (defun tensor-size (tensor) (shape-size (tensor-shape tensor)))
 (defun tensor-rank (tensor) (length (tensor-shape tensor)))
 (defun tensor-dim (tensor i) (aref (tensor-shape tensor) i))

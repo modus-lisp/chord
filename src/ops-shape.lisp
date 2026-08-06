@@ -36,15 +36,88 @@ is safe because no op in chord writes into its inputs — the ones that would
 (defun zero-strides (rank)
   (make-array (max 1 rank) :element-type 'fixnum :initial-element 0))
 
+(defun collapse-gather-axes (out-shape strides)
+  "OUT-SHAPE and STRIDES rewritten with the fewest axes that describe the same
+walk, outermost first.  Two values, both simple FIXNUM vectors: extents and
+strides.
+
+Two rules, and between them they are most of what makes this copy fast.  An axis
+of extent 1 is one step of no size, so it is dropped.  And two adjacent axes
+where the outer one's stride is exactly the inner one's span — STRIDE-OUT =
+STRIDE-IN * EXTENT-IN — visit a contiguous block of source indices in ascending
+order, which is one axis of their product.  That is the common case rather than a
+corner one: a Slice or a Split that only cuts an outer axis leaves everything to
+its right untouched, so the whole tail collapses to a single run and the copy
+becomes one block move.
+
+The output is dense row-major either way, so this only ever reasons about the
+source side; the destination is written straight through."
+  (let ((ext '()) (st '()))
+    (loop for k of-type fixnum from 0 below (length out-shape)
+          for e of-type fixnum = (aref out-shape k)
+          for s of-type fixnum = (aref strides k)
+          do (cond ((= e 1))
+                   ;; EXT's head is the innermost axis so far, which is the one
+                   ;; this axis sits inside of
+                   ((and ext (= (the fixnum (first st)) (* s e)))
+                    (setf (first ext) (* (the fixnum (first ext)) e)
+                          (first st) s))
+                   (t (push e ext) (push s st))))
+    (let* ((r (length ext))
+           (ev (make-array (max 1 r) :element-type 'fixnum :initial-element 1))
+           (sv (make-array (max 1 r) :element-type 'fixnum :initial-element 0)))
+      ;; EXT was built innermost-first, and the walk wants outermost-first
+      (loop for e in ext for s in st for k downfrom (1- r)
+            do (setf (aref ev k) e (aref sv k) s))
+      (values ev sv r))))
+
 (defun tensor-gather-strided (a base strides out-shape)
   "Read A through STRIDES starting at BASE, walking OUT-SHAPE.  This is the one
-copy loop behind Slice, Transpose, and Expand — they differ only in the strides
-they hand it."
-  (let ((out (make-tensor (tensor-dtype a) out-shape))
-        (zero (zero-strides (length out-shape))))
-    (with-two-typed-data (da a) (dr out)
-      (do-broadcast ((ia strides) (ib zero) out-shape)
-        (setf (aref dr i) (aref da (+ base ia)))))
+copy loop behind Slice, Transpose, Expand and Split — they differ only in the
+strides they hand it, and on this graph it is a fifth of a single-threaded
+synthesis, so it is written as three cases rather than one.
+
+After COLLAPSE-GATHER-AXES the innermost axis is the run, and the axes outside it
+are an odometer that runs once per run instead of once per element.  A run of
+stride 1 is a block move; SBCL's REPLACE between two simple arrays of the same
+element type is a memmove, which is the whole point of collapsing.  A run of any
+other stride is a typed gather — that is what a real Transpose leaves behind, and
+even there the odometer is off the hot path.
+
+The output gets every element assigned, so it starts unfilled: MAKE-TENSOR would
+zero a buffer this loop is about to overwrite completely, and these buffers are
+hundreds of kilobytes."
+  (let* ((out (make-tensor-unfilled (tensor-dtype a) out-shape))
+         (n (tensor-size out)))
+    (declare (type index n))
+    (when (plusp n)
+      (multiple-value-bind (ext st r) (collapse-gather-axes out-shape strides)
+        (declare (type (simple-array fixnum (*)) ext st) (type fixnum r))
+        (with-two-typed-data (da a) (dr out)
+          (locally (declare (optimize (speed 3) (safety 0)))
+            (let* ((inner (if (plusp r) (aref ext (1- r)) 1))
+                   (istep (if (plusp r) (aref st (1- r)) 1))
+                   (outer (floor n inner))
+                   (idx (make-array (max 1 r) :element-type 'fixnum
+                                              :initial-element 0))
+                   (src base)
+                   (dst 0))
+              (declare (type index inner outer dst) (type fixnum istep src))
+              (dotimes (o outer)
+                (declare (type index o))
+                (if (= istep 1)
+                    (replace dr da :start1 dst :end1 (+ dst inner) :start2 src)
+                    (loop for k of-type index from 0 below inner
+                          do (setf (aref dr (+ dst k))
+                                   (aref da (+ src (* k istep))))))
+                (incf dst inner)
+                ;; odometer over everything outside the run, innermost first
+                (loop for k of-type fixnum from (- r 2) downto 0
+                      do (incf src (aref st k))
+                         (incf (aref idx k))
+                         (when (< (aref idx k) (aref ext k)) (return))
+                         (decf src (* (aref idx k) (aref st k)))
+                         (setf (aref idx k) 0))))))))
     out))
 
 ;;; ---- shape reporting and reshaping -----------------------------------------
