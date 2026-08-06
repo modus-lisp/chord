@@ -13,6 +13,7 @@
                 :serial t
                 :components ((:file "packages")
                              (:file "tensor")
+                             (:file "simd")
                              (:file "parallel")
                              (:file "model")
                              (:file "graph")

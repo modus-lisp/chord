@@ -25,15 +25,20 @@ three that cannot be compared are the two Gaussian draws and the one multiply
 between a draw and its noise-scale gate; the gate names them rather than skipping
 them quietly. The finished waveform differs from onnxruntime's by at most 5.3e-5
 — below the 3.05e-5 step of the 16-bit WAV it gets written to. It started at
-0.05x realtime and now runs **faster than realtime**: warm, on a busy 116-core
-box, the median of 15 sentences is 0.75x on one thread, 3.33x on the default 16
-and 4.22x on 64 (`CHORD_THREADS` sets it). `inspect/profile.lisp` reports lower,
-because it times one cold run including the first lexicon lookup.
+0.05x realtime and now runs **faster than realtime on a single core**: warm, on
+a busy 116-core box, the median of 15 sentences is 1.64x on one thread, 4.44x on
+the default 16 and 4.76x on 64 (`CHORD_THREADS` sets it). `inspect/profile.lisp`
+reports lower, because it times one cold run including the first lexicon lookup.
 
-Convolution is now 71% of what is left. Its inner loop runs at about half of
-what scalar floating point on one core can do, and the dominant layer gets 7.8x
-out of 16 threads and 11.3x out of 64 — so the next real gain there is SIMD, and
-SIMD is the one lever that would not help the machine this is aimed at.
+Convolution is most of that, and it is vectorized — `src/simd.lisp` is five
+operations and a lane count wide, and every kernel is written in those, so the
+ARM machine this is ultimately aimed at needs one new arm in one file rather
+than a second copy of the convolution. Lanes go across the output, never across
+the kernel taps, and it does not use fused multiply-add even though the CPU has
+it: both would change the order the terms are added in, and the point of
+`inspect/conv-gate.lisp` comparing exactly is that nothing does. Measured
+against the same build with the vector unit turned off, one thread went 0.75x →
+1.64x and sixteen went 3.25x → 4.44x.
 
 Two gates make going fast safe. The per-node one is the reason any of it could
 be attempted at all. `inspect/conv-gate.lisp` covers the convolution kernel
@@ -72,6 +77,7 @@ part-of-speech tag, which is a different problem.
     src/g2p.lisp        the four stages, in order
 
     src/tensor.lisp     flat typed vector + shape; broadcasting via zero strides
+    src/simd.lisp       one vector width, named once (AVX2 today, NEON next)
     src/model.lisp      reads the exported graph and weight blob
     src/graph.lisp      the interpreter: run the nodes in order, drop dead values
     src/ops-*.lisp      the 50 ops, grouped by what they do

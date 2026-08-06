@@ -150,18 +150,13 @@ into DA/DB/DR; row R belongs to batch item (FLOOR R M)."
            (type dim dst src count stride)
            (optimize (speed 3) (safety 0)))
   (if (= stride 1)
-      (let ((quad (logandc2 count 3)))
-        (declare (type dim quad))
-        (do ((i 0 (+ i 4))) ((>= i quad))
-          (declare (type dim i))
-          (let ((a (+ dst i)) (b (+ src i)))
-            (declare (type dim a b))
-            (setf (aref dr a)       (+ (aref dr a)       (* weight (aref dx b)))
-                  (aref dr (+ a 1)) (+ (aref dr (+ a 1)) (* weight (aref dx (+ b 1))))
-                  (aref dr (+ a 2)) (+ (aref dr (+ a 2)) (* weight (aref dx (+ b 2))))
-                  (aref dr (+ a 3)) (+ (aref dr (+ a 3)) (* weight (aref dx (+ b 3)))))))
-        (loop for i of-type dim from quad below count
-              do (incf (aref dr (+ dst i)) (* weight (aref dx (+ src i))))))
+      (let ((wv (f32v-broadcast weight)))
+        (do-vectorized (iv is count)
+          (setf (f32v-ref dr (+ dst iv))
+                (f32v+ (f32v-ref dr (+ dst iv)) (f32v* wv (f32v-ref dx (+ src iv)))))
+          (incf (aref dr (+ dst is)) (* weight (aref dx (+ src is))))))
+      ;; a strided read cannot be one load, and every Conv in this graph is
+      ;; stride 1 — this arm is for the gate's sweep and for ConvTranspose
       (loop for i of-type dim from 0 below count
             do (incf (aref dr (+ dst i)) (* weight (aref dx (+ src (* i stride)))))))
   (values))
@@ -191,17 +186,36 @@ into DA/DB/DR; row R belongs to batch item (FLOOR R M)."
 
 (defmacro %conv-fused-body (kw)
   "The fused loop for a literal KW, so the tap count is a compile-time constant
-and the weights and source bases hoist out of the loop."
+and the weights and source bases hoist out of the loop.
+
+Vectorized over the output tap, which is the choice that costs nothing: each
+lane is a different element of the row, so every element's KW terms are still
+summed one after another in the same order and the answer is the scalar answer
+bit for bit.  Putting the lanes across the taps instead — the obvious reading of
+\"fused\" — would have meant a horizontal sum at the end, which reassociates."
   (let ((ws (loop for k below kw collect (gensym "W")))
-        (ss (loop for k below kw collect (gensym "S"))))
-    `(let (,@(loop for w in ws for k from 0 collect `(,w (aref dw (+ wrow ,k))))
-           ,@(loop for s in ss for k from 0 collect `(,s (+ src (* ,k dilation)))))
-       (declare (type single-float ,@ws) (type dim ,@ss))
-       (loop for i of-type dim from 0 below count
-             do (setf (aref dr (+ dst i))
-                      (+ (aref dr (+ dst i))
-                         ,@(loop for w in ws for s in ss
-                                 collect `(* ,w (aref dx (+ ,s i))))))))))
+        (vs (loop for k below kw collect (gensym "V")))
+        (ss (loop for k below kw collect (gensym "S")))
+        (iv (gensym "IV")) (is (gensym "IS")))
+    (flet ((chain (index scalarp)
+             ;; ((dr + w0*x0) + w1*x1) + ... , left to right, which is the order
+             ;; the separate per-tap passes accumulated in
+             (loop with acc = (if scalarp
+                                  `(aref dr (+ dst ,index))
+                                  `(f32v-ref dr (+ dst ,index)))
+                   for s in ss
+                   for w in (if scalarp ws vs)
+                   do (setf acc (if scalarp
+                                    `(+ ,acc (* ,w (aref dx (+ ,s ,index))))
+                                    `(f32v+ ,acc (f32v* ,w (f32v-ref dx (+ ,s ,index))))))
+                   finally (return acc))))
+      `(let (,@(loop for w in ws for k from 0 collect `(,w (aref dw (+ wrow ,k))))
+             ,@(loop for s in ss for k from 0 collect `(,s (+ src (* ,k dilation)))))
+         (declare (type single-float ,@ws) (type dim ,@ss))
+         (let (,@(loop for v in vs for w in ws collect `(,v (f32v-broadcast ,w))))
+           (do-vectorized (,iv ,is count)
+             (setf (f32v-ref dr (+ dst ,iv)) ,(chain iv nil))
+             (setf (aref dr (+ dst ,is)) ,(chain is t))))))))
 
 (defun conv-fused (dr dx dw wrow kw dilation dst src count)
   "DR[DST+i] += sum over k in [0, KW) of DW[WROW+k] * DX[SRC + k*DILATION + i],
