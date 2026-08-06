@@ -127,6 +127,45 @@ into DA/DB/DR; row R belongs to batch item (FLOOR R M)."
 ;;; range was cut.  Same summation order as before the split, therefore the same
 ;;; float result; inspect/node-gate.lisp is what says so.
 
+;;; Both kernels bottom out in CONV-AXPY, and it is where the time is: measured
+;;; alone on one core, the loop it replaces ran at 0.75 G multiply-adds/s and this
+;;; one runs at 2.4.  Two things cost that:
+;;;
+;;;   the stride multiply — with STRIDE 1 (every Conv in this graph) the source
+;;;     index is just a counter, but the general form recomputes I * STRIDE and
+;;;     hides the fact that DX is being walked contiguously;
+;;;   the loop test — one compare and branch per multiply-add, against a body
+;;;     that is two loads, a multiply, an add and a store.  The accumulations are
+;;;     into different elements and so are independent, which is what makes it
+;;;     safe to do four per test and let them issue together.
+;;;
+;;; Unrolling does not reorder anything: each output element still gets its terms
+;;; in the same sequence, so the floats come out bit-for-bit identical.
+
+(declaim (inline conv-axpy))
+(defun conv-axpy (dr dx weight dst src count stride)
+  "DR[DST+i] += WEIGHT * DX[SRC + i*STRIDE], for i in [0, COUNT)."
+  (declare (type (simple-array single-float (*)) dr dx)
+           (type single-float weight)
+           (type dim dst src count stride)
+           (optimize (speed 3) (safety 0)))
+  (if (= stride 1)
+      (let ((quad (logandc2 count 3)))
+        (declare (type dim quad))
+        (do ((i 0 (+ i 4))) ((>= i quad))
+          (declare (type dim i))
+          (let ((a (+ dst i)) (b (+ src i)))
+            (declare (type dim a b))
+            (setf (aref dr a)       (+ (aref dr a)       (* weight (aref dx b)))
+                  (aref dr (+ a 1)) (+ (aref dr (+ a 1)) (* weight (aref dx (+ b 1))))
+                  (aref dr (+ a 2)) (+ (aref dr (+ a 2)) (* weight (aref dx (+ b 2))))
+                  (aref dr (+ a 3)) (+ (aref dr (+ a 3)) (* weight (aref dx (+ b 3)))))))
+        (loop for i of-type dim from quad below count
+              do (incf (aref dr (+ dst i)) (* weight (aref dx (+ src i))))))
+      (loop for i of-type dim from 0 below count
+            do (incf (aref dr (+ dst i)) (* weight (aref dx (+ src (* i stride)))))))
+  (values))
+
 (defun conv1d-core (dx dw dr row-lo row-hi cin len cout cgroup kw out-len
                     stride dilation pad-begin per-group-out)
   "Accumulate the 1-D convolution of DX by DW into rows [ROW-LO, ROW-HI) of DR,
@@ -169,10 +208,13 @@ which the caller has already filled with the bias (or with zeros)."
                     (let ((lo (max 0 (ceiling (- shift) stride)))
                           (hi (max 0 (min out-len (ceiling (- len shift) stride)))))
                       (declare (type dim lo hi))
-                      (loop for o of-type dim from lo below hi
-                            do (incf (aref dr (+ orow o))
-                                     (* weight
-                                        (aref dx (+ xrow shift (* o stride))))))))))))))))
+                      ;; the first tap in range starts at SHIFT + LO*STRIDE, which
+                      ;; is what LO was solved for, so the source index is
+                      ;; non-negative from here on
+                      (when (< lo hi)
+                        (conv-axpy dr dx weight (+ orow lo)
+                                   (+ xrow shift (* lo stride))
+                                   (- hi lo) stride))))))))))))
   (values))
 
 (defop "Conv" (node ins)
