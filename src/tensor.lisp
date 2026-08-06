@@ -49,21 +49,92 @@ row-major order."
 (defun dtype-zero (dtype)
   (ecase dtype (:f32 0.0f0) (:f64 0.0d0) ((:i64 :i32 :bool) 0)))
 
+(declaim (inline dtype-element-bytes))
+(defun dtype-element-bytes (dtype)
+  (ecase dtype (:f32 4) (:f64 8) (:i64 8) (:i32 4) (:bool 1)))
+
 (defun shape-size (shape)
   (let ((n 1)) (declare (type index n))
     (loop for d across shape do (setf n (* n (the index d))))
     n))
 
+;;; ---- reusing data vectors --------------------------------------------------
+;;;
+;;; A synthesis allocates ~240 MB of intermediates and collects nearly all of it,
+;;; and the collection is not what costs: gencgc drops a generation that survived
+;;; nothing almost for free.  What costs is the other end — a multi-megabyte
+;;; vector is a large object, so every one of them is fresh pages the kernel has
+;;; to map and the runtime has to zero, and the profile put ~9% of a run in
+;;; ALLOCATE-VECTOR-WITH-WIDETAG and gc_alloc_large underneath it.
+;;;
+;;; RUN-MODEL already knows the moment a value is dead, because it computed every
+;;; value's last reader before starting.  Binding *TENSOR-POOL* hands those dead
+;;; vectors back here instead of to the collector, and MAKE-TENSOR takes one
+;;; rather than asking for pages that are already warm in this process.  Outside
+;;; RUN-MODEL the variable is NIL and none of this exists, which is what keeps it
+;;; invisible to the gates and to any other caller.
+
+(defvar *tensor-pool* nil
+  "EQUAL hash of (dtype . length) -> a list of free data vectors, or NIL.
+Only RUN-MODEL binds it, and only when it is dropping dead values at all.")
+
+(defvar *tensor-pool-bytes* 0
+  "How much the pool is holding, so it cannot grow into the retain-everything
+memory profile the drop logic exists to avoid.")
+
+(defparameter *tensor-pool-budget* (* 48 1024 1024)
+  "Bytes the pool may hold on to.  Past this a dead vector is simply dropped —
+the point is to recycle the working set, not to keep the whole graph alive.")
+
+(defun pool-take (dtype n)
+  "A free data vector of N elements of DTYPE, or NIL.  Its contents are whatever
+the last owner left; every caller either fills it or assigns every element."
+  (let ((tbl *tensor-pool*))
+    (when tbl
+      (let* ((key (cons dtype n))
+             (free (gethash key tbl)))
+        (when free
+          (setf (gethash key tbl) (cdr free))
+          (decf *tensor-pool-bytes* (* n (dtype-element-bytes dtype)))
+          (car free))))))
+
+(defun pool-release (dtype data)
+  "Offer DATA back to the pool.  Silently declines once the budget is reached."
+  (let ((tbl *tensor-pool*)
+        (n (length data)))
+    (when (and tbl (plusp n))
+      (let ((bytes (* n (dtype-element-bytes dtype))))
+        (when (<= (+ *tensor-pool-bytes* bytes) *tensor-pool-budget*)
+          (push data (gethash (cons dtype n) tbl))
+          (incf *tensor-pool-bytes* bytes)))))
+  (values))
+
+(defun fill-typed (dtype data value)
+  "FILL, with the element type known, so it becomes a word bash rather than a
+generic loop over an array of unknown type."
+  (ecase dtype
+    (:f32 (fill (the (simple-array single-float (*)) data)
+                (the single-float value)))
+    (:f64 (fill (the (simple-array double-float (*)) data)
+                (the double-float value)))
+    (:i64 (fill (the (simple-array (signed-byte 64) (*)) data)
+                (the (signed-byte 64) value)))
+    (:i32 (fill (the (simple-array (signed-byte 32) (*)) data)
+                (the (signed-byte 32) value)))
+    (:bool (fill (the (simple-array (unsigned-byte 8) (*)) data)
+                 (the (unsigned-byte 8) value)))))
+
 (defun make-tensor (dtype shape &key (initial-element nil ie-p))
   "A new tensor of DTYPE.  SHAPE may be a list or a vector."
   (let* ((shape (coerce shape 'simple-vector))
          (n (shape-size shape))
-         (et (dtype-element-type dtype)))
+         (et (dtype-element-type dtype))
+         (value (if ie-p (coerce initial-element et) (dtype-zero dtype)))
+         (reused (pool-take dtype n)))
     (%make-tensor dtype shape
-                  (make-array n :element-type et
-                                :initial-element (if ie-p
-                                                     (coerce initial-element et)
-                                                     (dtype-zero dtype))))))
+                  (cond (reused (fill-typed dtype reused value) reused)
+                        (t (make-array n :element-type et
+                                         :initial-element value))))))
 
 (defun tensor-size (tensor) (shape-size (tensor-shape tensor)))
 (defun tensor-rank (tensor) (length (tensor-shape tensor)))

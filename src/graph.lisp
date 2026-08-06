@@ -73,25 +73,46 @@ Returns a hash table of value name -> tensor holding the graph outputs, plus
 whatever KEEP names, or every intermediate when KEEP-ALL.  ON-NODE, if given, is
 called with (index node outputs) as each node finishes — which is how the gate
 compares against onnxruntime without the runner knowing anything about fixtures."
-  (let ((vals (make-hash-table :test #'equal :size 4096))
-        (last (unless keep-all (last-use-table model)))
-        (pin (make-hash-table :test #'equal)))
-    (dolist (name keep) (setf (gethash name pin) t))
-    (dolist (o (model-outputs model)) (setf (gethash (first o) pin) t))
-    ;; initializers are shared and never dropped: they are the weights
-    (maphash (lambda (k v) (setf (gethash k pin) t (gethash k vals) v))
-             (model-initializers model))
-    (flet ((feed (name tensor)
-             (let ((want (find name (model-inputs model) :key #'first :test #'string=)))
-               (unless want (error "~s is not an input of this model" name))
-               (unless (eq (tensor-dtype tensor) (second want))
-                 (error "input ~s wants ~a, got ~a" name (second want)
-                        (tensor-dtype tensor))))
-             (setf (gethash name pin) t
-                   (gethash name vals) tensor)))
-      (if (hash-table-p feeds)
-          (maphash #'feed feeds)
-          (loop for (name . tensor) in feeds do (feed name tensor))))
+  (let* ((vals (make-hash-table :test #'equal :size 4096))
+         (last (unless keep-all (last-use-table model)))
+         (pin (make-hash-table :test #'equal))
+         ;; How many live names hold each data vector.  Names, not tensors:
+         ;; RESHAPE-VIEW and the identity-shaped ops hand the same vector to a
+         ;; second name, and a vector is only free once every name holding it is
+         ;; gone.  Pinned names are never dropped, so the weights and the graph
+         ;; outputs simply never come back down to zero.
+         (refs (make-hash-table :test #'eq :size 4096))
+         (*tensor-pool* (unless keep-all (make-hash-table :test #'equal)))
+         (*tensor-pool-bytes* 0))
+    (flet ((bind (name tensor)
+             (setf (gethash name vals) tensor)
+             (when (tensor-p tensor)
+               (incf (gethash (tensor-data tensor) refs 0))))
+           (unbind (name)
+             (multiple-value-bind (v hit) (gethash name vals)
+               (when hit
+                 (remhash name vals)
+                 (when (tensor-p v)
+                   (let ((d (tensor-data v)))
+                     (when (zerop (decf (gethash d refs 1)))
+                       (remhash d refs)
+                       (pool-release (tensor-dtype v) d))))))))
+      (dolist (name keep) (setf (gethash name pin) t))
+      (dolist (o (model-outputs model)) (setf (gethash (first o) pin) t))
+      ;; initializers are shared and never dropped: they are the weights
+      (maphash (lambda (k v) (setf (gethash k pin) t) (bind k v))
+               (model-initializers model))
+      (flet ((feed (name tensor)
+               (let ((want (find name (model-inputs model) :key #'first :test #'string=)))
+                 (unless want (error "~s is not an input of this model" name))
+                 (unless (eq (tensor-dtype tensor) (second want))
+                   (error "input ~s wants ~a, got ~a" name (second want)
+                          (tensor-dtype tensor))))
+               (setf (gethash name pin) t)
+               (bind name tensor)))
+        (if (hash-table-p feeds)
+            (maphash #'feed feeds)
+            (loop for (name . tensor) in feeds do (feed name tensor))))
     ;; onnxruntime computes with IEEE defaults: dividing by zero gives an
     ;; infinity and the graph carries on.  SBCL traps by default, so a masked-off
     ;; region is what "the same arithmetic" actually means here.
@@ -118,7 +139,7 @@ compares against onnxruntime without the runner knowing anything about fixtures.
                (loop for name across (node-outputs node)
                      for o in outs
                      unless (string= name "")
-                       do (setf (gethash name vals) o))
+                       do (bind name o))
                (when trace
                  (format *trace-output* "~&~5d ~a ~a -> ~{~a~^, ~}~%" i (node-op node)
                          (node-name node)
@@ -131,7 +152,7 @@ compares against onnxruntime without the runner knowing anything about fixtures.
                  (loop for name across (node-inputs node)
                        unless (or (string= name "") (gethash name pin))
                          do (let ((lu (gethash name last)))
-                              (when (and lu (= lu i)) (remhash name vals))))))))
+                              (when (and lu (= lu i)) (unbind name)))))))))
     vals))
 
 (defun model-output-tensor (model vals &optional (which 0))

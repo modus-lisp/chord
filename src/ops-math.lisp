@@ -44,8 +44,10 @@ the decoder's (1,32,87808) Add outputs that fill is an 11 MB write pass thrown
 away by the very next loop — 1.5% of a synthesis sat in
 UB32-BASH-FILL-WITH-SINGLE-FLOAT doing it.  Only for kernels that assign every
 element; anything that accumulates into its output still needs MAKE-TENSOR."
-  (%make-tensor :f32 (coerce shape 'simple-vector)
-                (make-array (shape-size shape) :element-type 'single-float)))
+  (let ((n (shape-size shape)))
+    (%make-tensor :f32 (coerce shape 'simple-vector)
+                  (or (pool-take :f32 n)
+                      (make-array n :element-type 'single-float)))))
 
 ;;; ---- broadcasting without an odometer --------------------------------------
 
