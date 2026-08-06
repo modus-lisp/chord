@@ -1,0 +1,45 @@
+chord — third-party material, and what it is not
+================================================
+
+chord is MIT licensed (see LICENSE).  Two pieces of it come from elsewhere, and
+one thing that a text-to-speech engine usually contains is deliberately absent.
+
+
+data/cmudict.dict — the CMU Pronouncing Dictionary
+--------------------------------------------------
+
+Copyright (C) 1993-2015 Carnegie Mellon University.  Redistributed under the
+2-clause BSD licence reproduced in full at data/LICENSE.cmudict, which permits
+use and redistribution — including commercially — with attribution.
+
+    http://www.speech.cs.cmu.edu/cgi-bin/cmudict
+    https://github.com/cmusphinx/cmudict
+
+It is the authority for how chord says any word it lists, and the training data
+from which src/lts-data.lisp — the rules for words it does not list — is learned
+by tools/learn-lts.lisp.  Nothing else was used to build those rules.
+
+
+Voices
+------
+
+chord runs Piper VITS voices (https://github.com/rhasspy/piper), which are
+distributed separately under their own licences; no voice is included here.  A
+voice's phoneme_id_map defines the IPA inventory src/arpabet.lisp targets.
+
+
+No espeak, and why the absence is deliberate
+--------------------------------------------
+
+The usual way to turn English text into phonemes is espeak-ng, directly or
+through piper-phonemize.  espeak-ng is GPLv3, and a transcription of its rules
+or a redistribution of its compiled dictionary makes the resulting work GPLv3
+too.  chord therefore does not use, link, transcribe, or ship any part of it —
+the front end is CMUdict plus rules learned from CMUdict, which is why chord can
+be MIT.
+
+Note for anyone comparing output: because Piper voices were trained on
+espeak-ng's transcription, chord's ARPAbet-to-IPA table (src/arpabet.lisp) aims
+at that same IPA inventory.  Aiming at a target is not deriving from it — the
+table is a statement about US English transcription convention, written from
+published phonetic description and checked against the voice's own symbol list.
