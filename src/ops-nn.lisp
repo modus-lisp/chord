@@ -13,6 +13,55 @@
 (in-package #:chord)
 
 ;;; ---- matmul ----------------------------------------------------------------
+;;;
+;;; Split into a typed core and a shape-checking op for the same reason the conv
+;;; kernels below are, and it was worth more here than anywhere else: MatMul is
+;;; 26 nodes out of 2755 and was 22% of the run.  Untyped, every index expression
+;;; in the inner loop went through GENERIC-+ and every AREF through
+;;; HAIRY-DATA-VECTOR-REF/CHECK-BOUNDS, so the arithmetic was a small part of
+;;; what the arithmetic cost.
+;;;
+;;; A row here is one (batch item, output row) pair, flattened, which is what the
+;;; worker pool splits on.  The batch offsets are gathered into three vectors up
+;;; front rather than walked with DO-BROADCAST inside the kernel: a broadcast
+;;; walk is an odometer with a carry, which is inherently sequential, and there
+;;; are only a handful of batch items (attention heads) to gather.  Splitting on
+;;; the flattened pair rather than on rows-within-a-matrix matters because this
+;;; graph has both shapes — a few big matrices AND many small ones.
+;;;
+;;; Rows write disjoint slices of DR and each row's sum is accumulated in the
+;;; same order as before, so the split changes no float result; the node gate is
+;;; what says so.
+
+(defun matmul-core (da db dr ias ibs ios m k n row-lo row-hi)
+  "Accumulate rows [ROW-LO, ROW-HI) of a batch of matrix products into DR, which
+the caller has left zeroed.  IAS/IBS/IOS are the per-batch-item element offsets
+into DA/DB/DR; row R belongs to batch item (FLOOR R M)."
+  (declare (type (simple-array single-float (*)) da db dr)
+           (type (simple-array fixnum (*)) ias ibs ios)
+           (type dim m k n row-lo row-hi)
+           (optimize (speed 3) (safety 0)))
+  (loop for row of-type dim from row-lo below row-hi do
+    (multiple-value-bind (item r) (floor row m)
+      (declare (type dim item r))
+      (let ((arow (the dim (+ (aref ias item) (* r k))))
+            (orow (the dim (+ (aref ios item) (* r n))))
+            (bbase (the dim (aref ibs item))))
+        ;; k on the outside, n contiguous on the inside: one row of B is
+        ;; streamed per accumulation step instead of strided over.  The
+        ;; zero test is on the k loop, not the n loop, so it costs one branch
+        ;; per N multiply-adds — and this graph's attention matrices are full
+        ;; of exact zeros from masking.
+        (dotimes (kk k)
+          (declare (type dim kk))
+          (let ((x (aref da (the dim (+ arow kk))))
+                (brow (the dim (+ bbase (* kk n)))))
+            (unless (zerop x)
+              (dotimes (col n)
+                (declare (type dim col))
+                (incf (aref dr (the dim (+ orow col)))
+                      (* x (aref db (the dim (+ brow col))))))))))))
+  (values))
 
 (defop "MatMul" (node ins)
   (destructuring-bind (a b) ins
@@ -37,19 +86,19 @@
                (da (the (simple-array single-float (*)) (tensor-data a)))
                (db (the (simple-array single-float (*)) (tensor-data b)))
                (dr (the (simple-array single-float (*)) (tensor-data res))))
-          (declare (type index m k n))
-          (do-broadcast ((ia sa) (ib sb) (io so) batch)
-            (dotimes (row m)
-              (let ((arow (+ ia (* row k)))
-                    (orow (+ io (* row n))))
-                ;; k on the outside, n contiguous on the inside: one row of B is
-                ;; streamed per accumulation step instead of strided over
-                (dotimes (kk k)
-                  (let ((x (aref da (+ arow kk)))
-                        (brow (+ ib (* kk n))))
-                    (unless (zerop x)
-                      (dotimes (col n)
-                        (incf (aref dr (+ orow col)) (* x (aref db (+ brow col)))))))))))
+          (declare (type dim m k n))
+          (let* ((nb (max 1 (shape-size batch)))
+                 (ias (make-array nb :element-type 'fixnum :initial-element 0))
+                 (ibs (make-array nb :element-type 'fixnum :initial-element 0))
+                 (ios (make-array nb :element-type 'fixnum :initial-element 0)))
+            (do-broadcast ((ia sa) (ib sb) (io so) batch)
+              (setf (aref ias i) ia (aref ibs i) ib (aref ios i) io))
+            ;; a row costs K * N multiply-adds; hand a thread work worth having
+            (parallel-range (* nb m)
+                            (lambda (lo hi)
+                              (matmul-core da db dr ias ibs ios m k n lo hi))
+                            :min-chunk (max 1 (ceiling +parallel-grain+
+                                                       (max 1 (* k n))))))
           res)))))
 
 ;;; ---- convolution -----------------------------------------------------------
