@@ -1,19 +1,24 @@
 ;;;; packages.lisp — chord, a text-to-speech engine in pure Common Lisp.
+;;;;
+;;;; The tensors, the ONNX graph interpreter and the ops it dispatches to are not
+;;;; here — they are mill, which chord is one consumer of.  What is left in this
+;;;; package is the part that is about speech: a VITS voice, and English text.
+;;;;
+;;;; mill's engine names are re-exported rather than hidden, because a caller
+;;;; holding a voice sooner or later wants the tensor that came out of it.
+
 (defpackage #:chord
-  (:use #:cl)
+  (:use #:cl #:mill)
   (:export
-   ;; tensors
+   ;; the engine, by way of mill
    #:tensor #:tensor-p #:make-tensor #:tensor-data #:tensor-shape #:tensor-dtype
    #:tensor-size #:tensor-rank #:tensor-dim #:tensor-ref #:tensor-from-list
    #:tensor-scalar #:tensor-integers
    #:tensor-equal-p #:tensor-max-abs-diff #:print-tensor
-   ;; how many cores the kernels use, and how to give them back
    #:*worker-count* #:shutdown-workers
-   ;; models
    #:model #:load-model #:model-nodes #:model-initializers #:model-inputs #:model-outputs
    #:model-config #:model-opset
    #:node #:node-op #:node-name #:node-inputs #:node-outputs #:node-attrs #:node-attr
-   ;; execution
    #:run-model #:model-output-tensor #:*op-table* #:defop #:op-implemented-p
    #:unimplemented-op #:model-missing-ops
    #:*noise-seed* #:reset-noise #:random-normal

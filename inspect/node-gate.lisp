@@ -20,11 +20,14 @@
 ;;;; the noise is multiplied by a scale of zero and agrees again.
 
 (asdf:load-system :chord)
-(in-package #:chord)
-(load (merge-pathnames "npy.lisp" *load-truename*))
+(asdf:load-system :mill/npy)      ; the .npy reader, so onnxruntime's dumps
+(in-package #:chord)              ; can be read without a Python in the loop
 
-(defparameter *fixtures* #p"/mnt/lisp/chord/fixtures/")
-(defparameter *export* #p"/mnt/lisp/chord/export/en_US-lessac-medium.graph")
+(defparameter *fixtures*
+  (pathname (or (sb-posix:getenv "CHORD_FIXTURES") "/mnt/lisp/chord/fixtures/")))
+(defparameter *export*
+  (pathname (or (sb-posix:getenv "CHORD_GRAPH")
+                "/mnt/lisp/chord/export/en_US-lessac-medium.graph")))
 
 (defparameter *noise-tainted*
   '("/dp/RandomNormalLike_output_0" "/RandomNormalLike_output_0" "/Mul_5_output_0")
@@ -81,7 +84,7 @@ scale, and the comparison resumes there.")
          (worst 0d0) (worst-name nil)
          (failures '()))
     (format t "~&graph:    ~a~%" (file-namestring *export*))
-    (format t "phonemes: ~s~%" (getf manifest :phonemes))
+    (format t "outputs:  ~{~a~^, ~}~%" (getf manifest :outputs))
     (format t "nodes:    ~d, fixtures: ~d~%~%"
             (length (model-nodes model)) (length (getf manifest :values)))
     (handler-case

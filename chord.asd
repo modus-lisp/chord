@@ -1,27 +1,19 @@
 ;;;; chord — a text-to-speech engine in pure Common Lisp.
 ;;;;
-;;;; No FFI, no foreign libraries, no C.  The model is a VITS graph exported from
-;;;; ONNX by tools/export-onnx.py; chord executes it node for node so that every
-;;;; one of its 2755 nodes can be compared against onnxruntime's answer.
+;;;; No FFI, no foreign libraries, no C.  The voice is a VITS graph exported from
+;;;; ONNX; mill executes it node for node so that every one of its 2755 nodes can
+;;;; be compared against onnxruntime's answer.  What is in this system is the two
+;;;; ends mill knows nothing about: English text in, and a waveform out.
 
 (asdf:defsystem #:chord
   :description "Neural text-to-speech in pure Common Lisp."
   :author "ynniv"
   :license "MIT"
+  :depends-on (#:mill)
   :serial t
   :components ((:module "src"
                 :serial t
                 :components ((:file "packages")
-                             (:file "tensor")
-                             (:file "simd")
-                             (:file "parallel")
-                             (:file "model")
-                             (:file "graph")
-                             (:file "ops-shape")
-                             (:file "ops-math")
-                             (:file "ops-reduce")
-                             (:file "ops-index")
-                             (:file "ops-nn")
                              (:file "speech")
                              ;; grapheme-to-phoneme: CMUdict (BSD) for the words
                              ;; English has written down, learned rules for the
