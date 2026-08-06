@@ -166,6 +166,98 @@ into DA/DB/DR; row R belongs to batch item (FLOOR R M)."
             do (incf (aref dr (+ dst i)) (* weight (aref dx (+ src (* i stride)))))))
   (values))
 
+;;; CONV-AXPY still touches the output row once per kernel tap, and the decoder's
+;;; heavy layers have kw 5 and 7 — so a row is read and written seven times per
+;;; input channel to accumulate what is arithmetically one sum.  Once the loop
+;;; overhead was gone that traffic became the ceiling: Conv gets 6.2x out of 16
+;;; threads and 8.6x out of 64, which is what running out of memory bandwidth
+;;; looks like.  (Two ways of reducing the OTHER traffic were measured and thrown
+;;; away first — accumulating a row in an L1-sized tile, and cutting the time axis
+;;; so each input channel is read once per tile instead of once per output
+;;; channel.  Both were worth nothing, because the activations already fit in a
+;;; 32 MB L3 and were never going to memory.  The repeated row is.)
+;;;
+;;; CONV-FUSED does all KW taps in one pass. The taps of one kernel read DX at a
+;;; fixed spacing — DILATION — and land on the same output element, so the row is
+;;; loaded and stored once per input channel instead of KW times, while the reads
+;;; of DX are the same bytes the separate passes read anyway.
+;;;
+;;; The sum is written as one left-to-right (+ dr t0 t1 ...), which is the order
+;;; the separate passes accumulated in, so the floats do not move.
+;;;
+;;; Only for stride 1 — every Conv in this graph — since that is what makes the
+;;; window where all KW taps are inside the signal a single contiguous run.  The
+;;; handful of taps at each end, where the padding bites, go the per-tap way.
+
+(defmacro %conv-fused-body (kw)
+  "The fused loop for a literal KW, so the tap count is a compile-time constant
+and the weights and source bases hoist out of the loop."
+  (let ((ws (loop for k below kw collect (gensym "W")))
+        (ss (loop for k below kw collect (gensym "S"))))
+    `(let (,@(loop for w in ws for k from 0 collect `(,w (aref dw (+ wrow ,k))))
+           ,@(loop for s in ss for k from 0 collect `(,s (+ src (* ,k dilation)))))
+       (declare (type single-float ,@ws) (type dim ,@ss))
+       (loop for i of-type dim from 0 below count
+             do (setf (aref dr (+ dst i))
+                      (+ (aref dr (+ dst i))
+                         ,@(loop for w in ws for s in ss
+                                 collect `(* ,w (aref dx (+ ,s i))))))))))
+
+(defun conv-fused (dr dx dw wrow kw dilation dst src count)
+  "DR[DST+i] += sum over k in [0, KW) of DW[WROW+k] * DX[SRC + k*DILATION + i],
+for i in [0, COUNT).  Every tap is assumed in range; the caller establishes that."
+  (declare (type (simple-array single-float (*)) dr dx dw)
+           (type dim wrow kw dilation dst src count)
+           (optimize (speed 3) (safety 0)))
+  (case kw
+    (1 (%conv-fused-body 1)) (2 (%conv-fused-body 2)) (3 (%conv-fused-body 3))
+    (4 (%conv-fused-body 4)) (5 (%conv-fused-body 5)) (6 (%conv-fused-body 6))
+    (7 (%conv-fused-body 7)) (8 (%conv-fused-body 8))
+    ;; wider kernels than this graph has: still one pass over the row, but the
+    ;; tap loop stays a loop
+    (t (loop for i of-type dim from 0 below count
+             do (let ((acc (aref dr (+ dst i))))
+                  (declare (type single-float acc))
+                  (dotimes (k kw)
+                    (declare (type dim k))
+                    (setf acc (+ acc (* (aref dw (+ wrow k))
+                                        (aref dx (+ src (* k dilation) i))))))
+                  (setf (aref dr (+ dst i)) acc)))))
+  (values))
+
+(declaim (inline conv1d-taps))
+(defun conv1d-taps (dr dx dw wrow orow xrow kw dilation pad-begin stride len
+                    out-len range-lo range-hi)
+  "Accumulate every kernel tap into output taps [RANGE-LO, RANGE-HI) of one row,
+one pass per tap: the unfused path.  Used for the whole row when the fused one
+does not apply, and for the padded ends when it does."
+  (declare (type (simple-array single-float (*)) dr dx dw)
+           (type dim wrow orow xrow kw dilation stride len out-len
+                 range-lo range-hi)
+           (type (signed-byte 30) pad-begin)
+           (optimize (speed 3) (safety 0)))
+  (dotimes (kk kw)
+    (declare (type dim kk))
+    (let ((weight (aref dw (+ wrow kk)))
+          ;; the taps this kernel position contributes to are the ones whose
+          ;; source sample is inside the signal; solve for that range once
+          ;; instead of testing every tap
+          (shift (- (* kk dilation) pad-begin)))
+      (declare (type fixnum shift))
+      (unless (zerop weight)
+        ;; both ends are clamped into DIM: LO because a tap index is never
+        ;; negative, HI because an empty range has to stay representable when
+        ;; SHIFT runs off the end of the signal
+        (let ((lo (max range-lo (max 0 (ceiling (- shift) stride))))
+              (hi (min range-hi (max 0 (min out-len (ceiling (- len shift) stride))))))
+          (declare (type dim lo hi))
+          ;; the first tap in range starts at SHIFT + LO*STRIDE, which is what LO
+          ;; was solved for, so the source index is non-negative from here on
+          (when (< lo hi)
+            (conv-axpy dr dx weight (+ orow lo) (+ xrow shift (* lo stride))
+                       (- hi lo) stride))))))
+  (values))
+
 (defun conv1d-core (dx dw dr row-lo row-hi cin len cout cgroup kw out-len
                     stride dilation pad-begin per-group-out)
   "Accumulate the 1-D convolution of DX by DW into rows [ROW-LO, ROW-HI) of DR,
@@ -175,10 +267,19 @@ which the caller has already filled with the bias (or with zeros)."
                  per-group-out)
            (type (signed-byte 30) pad-begin)
            (optimize (speed 3) (safety 0)))
-  (let ((xplane (* cin len))            ; elements per batch item, input
-        (oplane (* cout out-len))       ;                          output
-        (wplane (* cgroup kw)))         ; elements per output channel, weights
-    (declare (type dim xplane oplane wplane))
+  (let* ((xplane (* cin len))           ; elements per batch item, input
+         (oplane (* cout out-len))      ;                          output
+         (wplane (* cgroup kw))         ; elements per output channel, weights
+         ;; the run of output taps for which every kernel tap reads a real
+         ;; sample: it starts once the leftmost tap clears the front padding and
+         ;; ends when the rightmost runs off the signal
+         (fuse (= stride 1))
+         (ilo (if fuse (min out-len (max 0 pad-begin)) 0))
+         (ihi (if fuse
+                  (max ilo (min out-len
+                                (max 0 (+ (- len (* (1- kw) dilation)) pad-begin))))
+                  0)))
+    (declare (type dim xplane oplane wplane ilo ihi))
     (loop for row of-type dim from row-lo below row-hi do
       (multiple-value-bind (nb m) (floor row cout)
         (declare (type dim nb m))
@@ -193,28 +294,20 @@ which the caller has already filled with the bias (or with zeros)."
                    (xrow (+ xbase (* chan len)))
                    (wrow (+ wbase (* c kw))))
               (declare (type dim chan xrow wrow))
-              (dotimes (kk kw)
-                (declare (type dim kk))
-                (let ((weight (aref dw (+ wrow kk)))
-                      ;; the taps this kernel position contributes to are the
-                      ;; ones whose source sample is inside the signal; solve
-                      ;; for that range once instead of testing every tap
-                      (shift (- (* kk dilation) pad-begin)))
-                  (declare (type fixnum shift))
-                  (unless (zerop weight)
-                    ;; both ends are clamped into DIM: LO because a tap index is
-                    ;; never negative, HI because an empty range has to stay
-                    ;; representable when SHIFT runs off the end of the signal
-                    (let ((lo (max 0 (ceiling (- shift) stride)))
-                          (hi (max 0 (min out-len (ceiling (- len shift) stride)))))
-                      (declare (type dim lo hi))
-                      ;; the first tap in range starts at SHIFT + LO*STRIDE, which
-                      ;; is what LO was solved for, so the source index is
-                      ;; non-negative from here on
-                      (when (< lo hi)
-                        (conv-axpy dr dx weight (+ orow lo)
-                                   (+ xrow shift (* lo stride))
-                                   (- hi lo) stride))))))))))))
+              (cond
+                ((and fuse (< ilo ihi))
+                 ;; the padded ends one tap at a time, the middle all at once.
+                 ;; At stride 1 the fused window's first source sample is ILO -
+                 ;; PAD-BEGIN taps in, which is exactly where the row starts
+                 (conv1d-taps dr dx dw wrow orow xrow kw dilation pad-begin stride
+                              len out-len 0 ilo)
+                 (conv-fused dr dx dw wrow kw dilation (+ orow ilo)
+                             (+ xrow (- ilo pad-begin)) (- ihi ilo))
+                 (conv1d-taps dr dx dw wrow orow xrow kw dilation pad-begin stride
+                              len out-len ihi out-len))
+                (t
+                 (conv1d-taps dr dx dw wrow orow xrow kw dilation pad-begin stride
+                              len out-len 0 out-len)))))))))
   (values))
 
 (defop "Conv" (node ins)
