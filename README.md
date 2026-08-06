@@ -25,18 +25,27 @@ three that cannot be compared are the two Gaussian draws and the one multiply
 between a draw and its noise-scale gate; the gate names them rather than skipping
 them quietly. The finished waveform differs from onnxruntime's by at most 5.3e-5
 — below the 3.05e-5 step of the 16-bit WAV it gets written to. It started at
-0.05x realtime and now runs **faster than realtime**: 0.63x on one thread, 2.36x
-on the default 16, 2.76x on 64 (`CHORD_THREADS` sets it). Convolution is about
-half of what is left, and it is bandwidth-bound rather than arithmetic-bound —
-which is why it gets 6.2x out of 16 threads and only 8.6x out of 64.
+0.05x realtime and now runs **faster than realtime**: warm, on a busy 116-core
+box, the median of 15 sentences is 0.75x on one thread, 3.33x on the default 16
+and 4.22x on 64 (`CHORD_THREADS` sets it). `inspect/profile.lisp` reports lower,
+because it times one cold run including the first lexicon lookup.
 
-The per-node gate is what made it safe to go fast, and
-`inspect/conv-gate.lisp` is what makes it safe to have gone fast in the
-convolution kernel specifically: 11342 cases of Conv and ConvTranspose against
-the definition, over strides, dilations, padding and kernel widths this voice
-never uses, compared **exactly** rather than within a tolerance. Every
-optimization in that kernel claims to leave the summation order alone, so a
-tolerance would hide the only kind of mistake worth catching.
+Convolution is now 71% of what is left. Its inner loop runs at about half of
+what scalar floating point on one core can do, and the dominant layer gets 7.8x
+out of 16 threads and 11.3x out of 64 — so the next real gain there is SIMD, and
+SIMD is the one lever that would not help the machine this is aimed at.
+
+Two gates make going fast safe. The per-node one is the reason any of it could
+be attempted at all. `inspect/conv-gate.lisp` covers the convolution kernel
+specifically: 11342 cases of Conv and ConvTranspose against the definition, over
+strides, dilations, padding and kernel widths this voice never uses, compared
+**exactly** rather than within a tolerance — every optimization in that kernel
+claims to leave the summation order alone, so a tolerance would hide the only
+kind of mistake worth catching. `inspect/pool-gate.lisp` covers the other thing
+the node gate cannot see: the interpreter recycles a value's data vector once
+its last reader has run, which the node gate never exercises because it keeps
+every value alive. It synthesizes with the recycling off and on and compares the
+waveforms bit for bit.
 
 *The front end.* English in, IPA out, in four stages: normalize the text, look
 the word up in [CMUdict](https://github.com/cmusphinx/cmudict), fall back to
@@ -79,6 +88,9 @@ part-of-speech tag, which is a different problem.
     inspect/lts-gate.lisp   the learned rules, on the held-out slice only
     inspect/g2p-gate.lisp   text to IPA, end to end
     inspect/node-gate.lisp  every node against onnxruntime, in order
+    inspect/conv-gate.lisp  Conv and ConvTranspose against the definition
+    inspect/pool-gate.lisp  recycled data vectors change no sample
+    inspect/profile.lisp    where a synthesis spends its time
 
 Protobuf parsing lives in Python because it runs once per model, at build time,
 on a workstation — never on the Pi this is aimed at. What ships is a text graph
@@ -89,10 +101,12 @@ a person can read and a blob of little-endian floats.
     sbcl --non-interactive --load inspect/text-gate.lisp   ; 154 pass, 8 known wrong
     sbcl --non-interactive --load inspect/lts-gate.lisp    ; 17 pass
     sbcl --non-interactive --load inspect/g2p-gate.lisp    ; 31 pass
+    sbcl --dynamic-space-size 4096 --load inspect/conv-gate.lisp  ; 11342 cases
+    sbcl --dynamic-space-size 8192 --load inspect/pool-gate.lisp
     sbcl --dynamic-space-size 8192 --load inspect/node-gate.lisp
 
-The first three need only what is in the repo. The last one needs an exported
-voice and onnxruntime fixtures:
+The first four need only what is in the repo. The last two need an exported
+voice, and the node gate also needs onnxruntime fixtures:
 
     python3 tools/export-onnx.py en_US-lessac-medium.onnx export/
     python3 tools/dump-fixtures.py en_US-lessac-medium.onnx fixtures/
