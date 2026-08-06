@@ -257,6 +257,32 @@ which the caller has already filled with the bias (or with zeros)."
                                                    (max 1 (* cgroup kw out-len)))))
         res))))
 
+;;; ConvTranspose's inner loop is CONV-AXPY read backwards: the contiguous walk
+;;; is over the input and the stride lands on the output, so the multiply cannot
+;;; be dropped — the upsampling layers here stride by 8.  Amortizing the loop test
+;;; over four independent accumulations still applies, and is all that is left to
+;;; take.
+(declaim (inline conv-scatter))
+(defun conv-scatter (dr dx weight dst src count stride)
+  "DR[DST + i*STRIDE] += WEIGHT * DX[SRC+i], for i in [0, COUNT)."
+  (declare (type (simple-array single-float (*)) dr dx)
+           (type single-float weight)
+           (type dim dst src count stride)
+           (optimize (speed 3) (safety 0)))
+  (let ((quad (logandc2 count 3))
+        (s2 (* 2 stride)) (s3 (* 3 stride)) (s4 (* 4 stride)))
+    (declare (type dim quad s2 s3 s4))
+    (do ((i 0 (+ i 4)) (d dst (+ d s4)) (b src (+ b 4)))
+        ((>= i quad))
+      (declare (type dim i d b))
+      (setf (aref dr d)          (+ (aref dr d)          (* weight (aref dx b)))
+            (aref dr (+ d stride)) (+ (aref dr (+ d stride)) (* weight (aref dx (+ b 1))))
+            (aref dr (+ d s2))   (+ (aref dr (+ d s2))   (* weight (aref dx (+ b 2))))
+            (aref dr (+ d s3))   (+ (aref dr (+ d s3))   (* weight (aref dx (+ b 3))))))
+    (loop for i of-type dim from quad below count
+          do (incf (aref dr (+ dst (* i stride))) (* weight (aref dx (+ src i))))))
+  (values))
+
 (defun conv-transpose1d-core (dx dw dr row-lo row-hi cin len cout cgroup-in
                               cgroup-out kw out-len stride dilation pad-begin)
   "Scatter DX through DW into rows [ROW-LO, ROW-HI) of DR, which the caller has
@@ -296,9 +322,13 @@ already filled with the bias (or with zeros).  Note the weight layout:
                       (let ((lo (max 0 (ceiling (- shift) stride)))
                             (hi (max 0 (min len (ceiling (- out-len shift) stride)))))
                         (declare (type dim lo hi))
-                        (loop for l of-type dim from lo below hi
-                              do (incf (aref dr (+ orow shift (* l stride)))
-                                       (* weight (aref dx (+ xrow l))))))))))))))))
+                        ;; LO was solved for exactly the point where the output
+                        ;; tap stops being negative
+                        (when (< lo hi)
+                          (conv-scatter dr dx weight
+                                        (+ orow shift (* lo stride))
+                                        (+ xrow lo)
+                                        (- hi lo) stride)))))))))))))
   (values))
 
 (defop "ConvTranspose" (node ins)
