@@ -26,19 +26,33 @@ between a draw and its noise-scale gate; the gate names them rather than skippin
 them quietly. The finished waveform differs from onnxruntime's by at most 5.3e-5
 — below the 3.05e-5 step of the 16-bit WAV it gets written to. It started at
 0.05x realtime and now runs **faster than realtime on a single core**: warm, on
-a busy 116-core box, the median of 15 sentences is 1.64x on one thread, 4.44x on
-the default 16 and 4.76x on 64 (`CHORD_THREADS` sets it). `inspect/profile.lisp`
+a busy 116-core box, the median of 15 sentences is 2.48x on one thread, 4.97x on
+the default 16 and 5.50x on 64 (`CHORD_THREADS` sets it). `inspect/profile.lisp`
 reports lower, because it times one cold run including the first lexicon lookup.
 
-Convolution is most of that, and it is vectorized — `src/simd.lisp` is five
-operations and a lane count wide, and every kernel is written in those, so the
-ARM machine this is ultimately aimed at needs one new arm in one file rather
+Convolution is about half of that, and it is vectorized — `src/simd.lisp` is
+seven operations and a lane count wide, and every kernel is written in those, so
+the ARM machine this is ultimately aimed at needs one new arm in one file rather
 than a second copy of the convolution. Lanes go across the output, never across
 the kernel taps, and it does not use fused multiply-add even though the CPU has
 it: both would change the order the terms are added in, and the point of
-`inspect/conv-gate.lisp` comparing exactly is that nothing does. Measured
-against the same build with the vector unit turned off, one thread went 0.75x →
-1.64x and sixteen went 3.25x → 4.44x.
+`inspect/conv-gate.lisp` comparing exactly is that nothing does. The elementwise
+Add, Sub, Mul and Div go the same way, where the lanes are independent and there
+is nothing to reassociate at all.
+
+ConvTranspose is the odd one, because its output taps are strided and a strided
+store is not one store. It de-interleaves the output row by residue class first:
+a given kernel position only ever reaches outputs sharing one residue mod the
+stride, so writing those contiguously turns each pass into the same stride-1
+loop the Convs use — the same terms, added in the same order, at permuted
+addresses. That was worth 6x on the op.
+
+Measured against the same build with the vector unit turned off, one thread went
+0.76x → 2.48x, sixteen went 3.30x → 4.97x and sixty-four went 4.16x → 5.50x.
+That "turned off" build is not a separate implementation that could drift: the
+fallback arm of `src/simd.lisp` sets the lane count to 1 and every operation to
+its scalar self, so it is the same source with the width turned down — and it
+produces the same 205568 samples, byte for byte, that the AVX2 build does.
 
 Two gates make going fast safe. The per-node one is the reason any of it could
 be attempted at all. `inspect/conv-gate.lisp` covers the convolution kernel
@@ -77,7 +91,8 @@ part-of-speech tag, which is a different problem.
     src/g2p.lisp        the four stages, in order
 
     src/tensor.lisp     flat typed vector + shape; broadcasting via zero strides
-    src/simd.lisp       one vector width, named once (AVX2 today, NEON next)
+    src/simd.lisp       one vector width, named once (AVX2 today, NEON next;
+                        lanes = 1 is the fallback, and the scalar reference)
     src/model.lisp      reads the exported graph and weight blob
     src/graph.lisp      the interpreter: run the nodes in order, drop dead values
     src/ops-*.lisp      the 50 ops, grouped by what they do
