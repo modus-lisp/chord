@@ -92,49 +92,47 @@ graph a person can read and a blob of little-endian floats.
 
 ## The voice
 
-chord does not ship weights, but it is written against a voice you can freely use and
-redistribute:
+chord ships no weights — the best-sounding Piper voices are trained on corpora that forbid
+redistribution — so it fetches one on first use, in Lisp:
 
-    en_US-ljspeech-medium        Piper VITS, 22.05 kHz, 63 MB
-    LJSpeech (keithito.com)      PUBLIC DOMAIN — no attribution required
-
-Fetch it and convert it once, on a workstation:
-
-    B=https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/ljspeech/medium
-    curl -sLO $B/en_US-ljspeech-medium.onnx
-    curl -sLO $B/en_US-ljspeech-medium.onnx.json
-
-    python3 ../mill/tools/export-onnx.py en_US-ljspeech-medium.onnx export/
-    cp en_US-ljspeech-medium.onnx.json export/en_US-ljspeech-medium.config.json
-
-    (let ((v (chord:load-voice "export/en_US-ljspeech-medium.graph")))
+    (asdf:load-system :chord/fetch)
+    (chord:available-voices)                       ; what exists, and what each licence permits
+    (let ((v (chord:ensure-voice)))                ; fetches if absent, then loads
       (chord:say v (first (chord:text-to-ipa "Hello, world.")) "hello.wav"))
 
-The config travels with the graph because the phoneme inventory is per voice — ljspeech
-maps 157 symbols where lessac maps 154, so a graph without its config will mis-speak
-rather than fail.
+`ensure-voice` downloads over weft's pure-CL TLS and mill reads the `.onnx` **directly**, so there
+is no conversion step and nothing to install: no curl, no Python, no protobuf library. That matters
+because the machine doing this may be modus, where there is nothing underneath the Lisp to shell
+out to. `tools/export-onnx.py` still exists and still produces a smaller, faster-loading `.graph`,
+but it is now an optimization rather than a dependency, and `load-voice` takes either.
+
+The default is `en_US-lessac-medium`, because it is the best-sounding voice Piper publishes and
+this is a speech engine rather than a licence. **Its data is research-only and cannot be
+redistributed** — a constraint on shipping it, not on running it. `fetch-voice` says so when it
+fetches. Set `chord:*default-voice*` or `$CHORD_VOICE` to `en_US-ljspeech-medium` for a
+public-domain voice if what you make has to travel.
 
 ### Check the dataset licence, not the model licence
 
 The two are routinely different, and it is the dataset that binds. Piper's card for
-`en_US-lessac-medium` reads `License: mit` — which covers Piper's repository, not the
-speech. It links to the Blizzard 2013 Lessac licence, which grants use *for research
-purposes only*, forbids redistribution ("lend, hire, sell, distribute or otherwise part
-with the Materials"), and excludes "the development, marketing, commercialisation, sale
-or licencing of voice synthesis ... products". Weights trained on that data are a derived
-work of it, so that voice cannot be shipped with anything.
+`en_US-lessac-medium` reads `License: mit` — which covers Piper's repository, not the speech. It
+links to the Blizzard 2013 Lessac licence, which grants use *for research purposes only*, forbids
+redistribution ("lend, hire, sell, distribute or otherwise part with the Materials"), and excludes
+"the development, marketing, commercialisation, sale or licencing of voice synthesis ... products".
+Weights trained on that data are a derived work of it.
 
-Of the en_US Piper voices, these are the ones whose data is actually free:
+`chord:available-voices` prints the licence of the training data for every voice it knows, which is
+the fact that is hard to find and easy to get wrong. Of the English Piper voices, `ljspeech`,
+`kristin`, `norman` and `cori` are public domain, `joe` and `mike` are CC0, `libritts` and `alba`
+are CC BY 4.0 — and `ryan`, `hfc_*` and `lessac` cannot be shipped at all.
 
-    ljspeech            public domain      the recommendation above
-    kristin, norman     public domain      LibriVox
-    libritts, libritts_r  CC BY 4.0        attribution required
-    ryan, hfc_female    CC BY-NC-SA 4.0    non-commercial only — not usable here
-    lessac              research only      not usable at all
+A multi-speaker voice (`libritts` carries 904) takes `:speaker N`:
+
+    (chord:say v ipa "out.wav" :speaker 96)
 
 What IS in this repo is `data/cmudict.dict` (the CMU Pronouncing Dictionary, BSD) and
-`src/lts-data.lisp`, the letter-to-sound rules learned from it — both freely
-redistributable, which is why they ship.
+`src/lts-data.lisp`, the letter-to-sound rules learned from it — both freely redistributable, which
+is why they ship.
 
 ## Running the gates
 

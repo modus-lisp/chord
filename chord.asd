@@ -25,3 +25,13 @@
                              (:file "arpabet")
                              (:file "text")
                              (:file "g2p")))))
+
+;; Fetching a voice needs an HTTPS client, and weft's is pure CL — but a chord that only ever
+;; loads a voice already on disk should not have to carry a TLS stack, so it is a separate system.
+(asdf:defsystem #:chord/fetch
+  :description "Download a Piper voice over weft's pure-CL TLS, with the licence of each stated."
+  :author "ynniv"
+  :license "MIT"
+  :depends-on (#:chord #:weft/fetch)
+  :serial t
+  :components ((:module "src" :serial t :components ((:file "fetch")))))
