@@ -90,6 +90,36 @@ tools that turn a `.onnx` into something either of them can read — they run on
 per model, at build time, on a workstation, never on the Pi. What ships is a text
 graph a person can read and a blob of little-endian floats.
 
+## The voice, and why it is not here
+
+chord does not ship a voice, and for `en_US-lessac-medium` specifically it must not.
+
+Piper's model card for that voice reads `License: mit`, but that covers the Piper
+repository, not the speech it was trained on. It points at the Blizzard 2013
+Lessac dataset licence, which grants use *for research purposes only* and
+prohibits redistribution — "lend, hire, sell, distribute or otherwise part with
+the Materials" — and explicitly excludes "the development, marketing,
+commercialisation, sale or licencing of voice synthesis ... products". A 62 MB
+blob of weights trained on that data is a derived work of it. So the voice stays
+on the machine that downloaded it.
+
+To run chord, fetch a voice yourself and convert it once:
+
+    # any Piper VITS voice, e.g. from huggingface.co/rhasspy/piper-voices
+    python3 ../mill/tools/export-onnx.py en_US-lessac-medium.onnx export/
+    cp en_US-lessac-medium.onnx.json export/en_US-lessac-medium.config.json
+
+    (chord:load-voice "export/en_US-lessac-medium.graph")
+
+If you want a voice you can redistribute with your own work, choose one trained
+on a permissive corpus — check the dataset licence the voice's model card links
+to, not just the licence on the model repository. The two are routinely
+different, and it is the dataset that binds.
+
+What IS in this repo is `data/cmudict.dict` (the CMU Pronouncing Dictionary, BSD)
+and `src/lts-data.lisp`, the letter-to-sound rules learned from it — both freely
+redistributable, which is why they ship.
+
 ## Running the gates
 
     sbcl --non-interactive --load inspect/text-gate.lisp   ; 154 pass, 8 known wrong
