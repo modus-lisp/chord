@@ -8,7 +8,7 @@ chord takes English text and produces a 22.05 kHz waveform. In between it runs a
 2755 nodes and 15.65M parameters.
 
     (asdf:load-system :chord)
-    (let ((v (chord:load-voice "export/en_US-lessac-medium.graph")))
+    (let ((v (chord:load-voice "export/en_US-ljspeech-medium.graph")))
       (chord:say v (first (chord:text-to-ipa "Hello, world."))
                  "hello.wav"))
 
@@ -90,34 +90,50 @@ tools that turn a `.onnx` into something either of them can read — they run on
 per model, at build time, on a workstation, never on the Pi. What ships is a text
 graph a person can read and a blob of little-endian floats.
 
-## The voice, and why it is not here
+## The voice
 
-chord does not ship a voice, and for `en_US-lessac-medium` specifically it must not.
+chord does not ship weights, but it is written against a voice you can freely use and
+redistribute:
 
-Piper's model card for that voice reads `License: mit`, but that covers the Piper
-repository, not the speech it was trained on. It points at the Blizzard 2013
-Lessac dataset licence, which grants use *for research purposes only* and
-prohibits redistribution — "lend, hire, sell, distribute or otherwise part with
-the Materials" — and explicitly excludes "the development, marketing,
-commercialisation, sale or licencing of voice synthesis ... products". A 62 MB
-blob of weights trained on that data is a derived work of it. So the voice stays
-on the machine that downloaded it.
+    en_US-ljspeech-medium        Piper VITS, 22.05 kHz, 63 MB
+    LJSpeech (keithito.com)      PUBLIC DOMAIN — no attribution required
 
-To run chord, fetch a voice yourself and convert it once:
+Fetch it and convert it once, on a workstation:
 
-    # any Piper VITS voice, e.g. from huggingface.co/rhasspy/piper-voices
-    python3 ../mill/tools/export-onnx.py en_US-lessac-medium.onnx export/
-    cp en_US-lessac-medium.onnx.json export/en_US-lessac-medium.config.json
+    B=https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/ljspeech/medium
+    curl -sLO $B/en_US-ljspeech-medium.onnx
+    curl -sLO $B/en_US-ljspeech-medium.onnx.json
 
-    (chord:load-voice "export/en_US-lessac-medium.graph")
+    python3 ../mill/tools/export-onnx.py en_US-ljspeech-medium.onnx export/
+    cp en_US-ljspeech-medium.onnx.json export/en_US-ljspeech-medium.config.json
 
-If you want a voice you can redistribute with your own work, choose one trained
-on a permissive corpus — check the dataset licence the voice's model card links
-to, not just the licence on the model repository. The two are routinely
-different, and it is the dataset that binds.
+    (let ((v (chord:load-voice "export/en_US-ljspeech-medium.graph")))
+      (chord:say v (first (chord:text-to-ipa "Hello, world.")) "hello.wav"))
 
-What IS in this repo is `data/cmudict.dict` (the CMU Pronouncing Dictionary, BSD)
-and `src/lts-data.lisp`, the letter-to-sound rules learned from it — both freely
+The config travels with the graph because the phoneme inventory is per voice — ljspeech
+maps 157 symbols where lessac maps 154, so a graph without its config will mis-speak
+rather than fail.
+
+### Check the dataset licence, not the model licence
+
+The two are routinely different, and it is the dataset that binds. Piper's card for
+`en_US-lessac-medium` reads `License: mit` — which covers Piper's repository, not the
+speech. It links to the Blizzard 2013 Lessac licence, which grants use *for research
+purposes only*, forbids redistribution ("lend, hire, sell, distribute or otherwise part
+with the Materials"), and excludes "the development, marketing, commercialisation, sale
+or licencing of voice synthesis ... products". Weights trained on that data are a derived
+work of it, so that voice cannot be shipped with anything.
+
+Of the en_US Piper voices, these are the ones whose data is actually free:
+
+    ljspeech            public domain      the recommendation above
+    kristin, norman     public domain      LibriVox
+    libritts, libritts_r  CC BY 4.0        attribution required
+    ryan, hfc_female    CC BY-NC-SA 4.0    non-commercial only — not usable here
+    lessac              research only      not usable at all
+
+What IS in this repo is `data/cmudict.dict` (the CMU Pronouncing Dictionary, BSD) and
+`src/lts-data.lisp`, the letter-to-sound rules learned from it — both freely
 redistributable, which is why they ship.
 
 ## Running the gates
