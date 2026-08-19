@@ -20,10 +20,46 @@
   (length-scale 1.0d0)
   (noise-w 0.8d0))
 
-(defun load-voice (graph-path)
+(defparameter *voice-dir*
+  (or (uiop:getenv "CHORD_VOICE_DIR")
+      (namestring (merge-pathnames ".chord/voices/" (user-homedir-pathname))))
+  "Where FETCH-VOICE puts voices, and where LOAD-VOICE looks when given no path.")
+
+(defparameter *default-voice*
+  (or (uiop:getenv "CHORD_VOICE") "en_US-lessac-medium")
+  "The voice LOAD-VOICE uses when called with no argument.  $CHORD_VOICE overrides.
+
+lessac by default because it is the best-sounding voice Piper publishes and this is a speech
+engine, not a licence.  Its TRAINING DATA is research-only and not redistributable, which is a
+constraint on shipping it, not on running it — see the README.  Set this to en_US-ljspeech-medium
+for a public-domain voice if what you make needs to travel.")
+
+(defun voice-path (&optional (name *default-voice*))
+  "Where NAME lives.  A path is taken as given; a bare name prefers the exporter's .graph if one is
+there and falls back to the .onnx, since either loads."
+  (if (or (find #\/ name) (string-equal "onnx" (pathname-type name))
+          (string-equal "graph" (pathname-type name)))
+      name
+      (let ((graph (merge-pathnames (concatenate 'string name ".graph") *voice-dir*))
+            (onnx (merge-pathnames (concatenate 'string name ".onnx") *voice-dir*)))
+        (namestring (if (probe-file graph) graph onnx)))))
+
+(defun load-voice (&optional (graph-path (voice-path)))
   "Load the voice exported to GRAPH-PATH.  The .bin and .config.json beside it
-come along automatically."
-  (let* ((model (load-model graph-path))
+come along automatically.  With no argument, loads *DEFAULT-VOICE* from *VOICE-DIR*.
+
+Weights are not part of this repository — the good Piper voices are trained on corpora that forbid
+redistribution — so a missing voice is a normal first-run state, and the error says how to fix it
+rather than complaining about a file."
+  (unless (probe-file graph-path)
+    (error "no voice at ~a.~%~%  Fetch one:  (chord:fetch-voice ~s)~%  Or list them: (chord:available-voices)~%"
+           graph-path *default-voice*))
+  ;; A .onnx is read directly, in Lisp; a .graph is the exporter's pre-chewed form.  Same MODEL
+  ;; either way — the exporter is now an optimization, not a dependency, which is what lets this
+  ;; run somewhere with no Python.
+  (let* ((model (if (string-equal "onnx" (pathname-type graph-path))
+                    (load-onnx graph-path)
+                    (load-model graph-path)))
          (config (model-config model)))
     (unless config
       (error "no config next to ~a — chord needs the phoneme id map that ships ~
@@ -65,10 +101,22 @@ no trace."
 
 ;;; ---- running it ------------------------------------------------------------
 
-(defun synthesize (voice phonemes &key noise-scale length-scale noise-w)
+(defun voice-speaker-count (voice)
+  "How many speakers this voice holds.  1 for an ordinary single-speaker voice."
+  (or (ignore-errors (gethash "num_speakers" (voice-config voice))) 1))
+
+(defun voice-multi-speaker-p (voice)
+  "True when the graph wants a SID input — i.e. the weights hold more than one voice."
+  (and (find "sid" (model-inputs (voice-model voice)) :key #'first :test #'string=) t))
+
+(defun synthesize (voice phonemes &key noise-scale length-scale noise-w (speaker 0))
   "Audio for PHONEMES as a single-float vector in [-1, 1], plus the sample rate.
 The three scales default to the voice's own; passing 0 for the two noise scales
-makes the run deterministic, which is what the fixtures were dumped with."
+makes the run deterministic, which is what the fixtures were dumped with.
+
+SPEAKER selects among the voices in a multi-speaker model — LibriTTS carries 904 of
+them in one graph, which is the difference between a corpus you may redistribute and
+one you may not.  A single-speaker graph declares no SID input and ignores it."
   (let* ((ids (phoneme-ids voice phonemes))
          (lengths (tensor-from-list :i64 (vector 1) (list (tensor-dim ids 1))))
          (scales (tensor-from-list
@@ -76,10 +124,18 @@ makes the run deterministic, which is what the fixtures were dumped with."
                   (list (or noise-scale (voice-noise-scale voice))
                         (or length-scale (voice-length-scale voice))
                         (or noise-w (voice-noise-w voice)))))
+         (n (voice-speaker-count voice))
          (vals (run-model (voice-model voice)
-                          (list (cons "input" ids)
-                                (cons "input_lengths" lengths)
-                                (cons "scales" scales))))
+                          (append (list (cons "input" ids)
+                                        (cons "input_lengths" lengths)
+                                        (cons "scales" scales))
+                                  ;; keyed off what the GRAPH declares, not off the config:
+                                  ;; the config is metadata, the input list is the contract
+                                  (when (voice-multi-speaker-p voice)
+                                    (unless (< -1 speaker n)
+                                      (error "speaker ~a out of range: this voice has ~a" speaker n))
+                                    (list (cons "sid" (tensor-from-list :i64 (vector 1)
+                                                                        (list speaker))))))))
          (out (model-output-tensor (voice-model voice) vals)))
     ;; the graph's output is (batch, time, 1, samples); this only ever runs one
     ;; utterance at a time, so the waveform is the whole thing flattened

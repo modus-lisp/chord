@@ -16,15 +16,16 @@
    #:tensor-scalar #:tensor-integers
    #:tensor-equal-p #:tensor-max-abs-diff #:print-tensor
    #:*worker-count* #:shutdown-workers
-   #:model #:load-model #:model-nodes #:model-initializers #:model-inputs #:model-outputs
+   #:model #:load-model #:load-onnx #:onnx->graph #:model-nodes #:model-initializers #:model-inputs #:model-outputs
    #:model-config #:model-opset
    #:node #:node-op #:node-name #:node-inputs #:node-outputs #:node-attrs #:node-attr
    #:run-model #:model-output-tensor #:*op-table* #:defop #:op-implemented-p
    #:unimplemented-op #:model-missing-ops
    #:*noise-seed* #:reset-noise #:random-normal
    ;; speech
-   #:voice #:load-voice #:voice-sample-rate #:voice-model #:voice-id-map
+   #:voice #:load-voice #:fetch-voice #:ensure-voice #:available-voices #:voice-licence #:*voice-catalogue* #:voice-path #:*voice-dir* #:*default-voice* #:voice-sample-rate #:voice-model #:voice-id-map
    #:voice-noise-scale #:voice-length-scale #:voice-noise-w
+   #:voice-config #:voice-speaker-count #:voice-multi-speaker-p
    #:phoneme-ids #:synthesize #:say #:write-wav
    ;; grapheme-to-phoneme
    #:text-to-ipa #:word-to-ipa #:word-phones #:arpabet-to-ipa
