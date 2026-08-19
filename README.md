@@ -148,9 +148,9 @@ The first three need only what is in the repo. The last two need an exported
 voice, and the node gate also needs onnxruntime fixtures — both of which are
 made with mill's tools, since neither is about speech:
 
-    python3 ../mill/tools/export-onnx.py en_US-lessac-medium.onnx export/
-    python3 tools/make-feeds.py en_US-lessac-medium.onnx feeds.npz
-    python3 ../mill/tools/dump-fixtures.py en_US-lessac-medium.onnx feeds.npz fixtures/
+    python3 ../mill/tools/export-onnx.py en_US-ljspeech-medium.onnx export/
+    python3 tools/make-feeds.py en_US-ljspeech-medium.onnx feeds.npz
+    python3 ../mill/tools/dump-fixtures.py en_US-ljspeech-medium.onnx feeds.npz fixtures/
 
 The gates that cover the arithmetic itself — Conv and ConvTranspose against the
 definition, and the strided copy behind Slice and Transpose — are in mill, and
