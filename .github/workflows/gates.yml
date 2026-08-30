@@ -40,4 +40,6 @@ jobs:
           sbcl --non-interactive --eval '(ql:quickload (list :chipz :salza2))'
       - name: Gate
         working-directory: chord
+        env:
+          CL_SOURCE_REGISTRY: '(:source-registry (:tree "${{ github.workspace }}/") (:exclude "vendor") (:exclude "deps") :inherit-configuration)'
         run: sbcl --dynamic-space-size 3072 --non-interactive --eval '(require :asdf)' --load inspect/g2p-gate.lisp
