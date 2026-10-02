@@ -18,7 +18,10 @@
   (id-map (make-hash-table :test #'equal) :type hash-table)
   (noise-scale 0.667d0)
   (length-scale 1.0d0)
-  (noise-w 0.8d0))
+  (noise-w 0.8d0)
+  ;; Kokoro only: the directory of per-voice style tables, and the one to use by default.
+  (styles nil)
+  (style-name nil))
 
 (defparameter *voice-dir*
   (or (uiop:getenv "CHORD_VOICE_DIR")
@@ -32,7 +35,8 @@
 lessac by default because it is the best-sounding voice Piper publishes and this is a speech
 engine, not a licence.  Its TRAINING DATA is research-only and not redistributable, which is a
 constraint on shipping it, not on running it — see the README.  Set this to en_US-ljspeech-medium
-for a public-domain voice if what you make needs to travel.")
+for a public-domain voice if what you make needs to travel.  kokoro-v1.0 loads too, when asked
+for by name.")
 
 (defun voice-path (&optional (name *default-voice*))
   "Where NAME lives.  A path is taken as given; a bare name prefers the exporter's .graph if one is
@@ -65,12 +69,18 @@ rather than complaining about a file."
       (error "no config next to ~a — chord needs the phoneme id map that ships ~
               with the voice" graph-path))
     (let ((audio (gethash "audio" config))
-          (inference (gethash "inference" config)))
+          (inference (gethash "inference" config))
+          (kokoro (gethash "kokoro" config)))
       (%make-voice
+       :styles (when kokoro
+                 (merge-pathnames (concatenate 'string (pathname-name graph-path) ".voices/")
+                                  (directory-namestring (truename graph-path))))
+       :style-name (when kokoro
+                     (or (sb-ext:posix-getenv "CHORD_KOKORO_VOICE") (gethash "default_voice" kokoro)))
        :model model
        :config config
        :sample-rate (if audio (gethash "sample_rate" audio) 22050)
-       :id-map (gethash "phoneme_id_map" config)
+       :id-map (or (gethash "phoneme_id_map" config) (gethash "vocab" config))
        :noise-scale (if inference (gethash "noise_scale" inference) 0.667d0)
        :length-scale (if inference (gethash "length_scale" inference) 1.0d0)
        :noise-w (if inference (gethash "noise_w" inference) 0.8d0)))))
@@ -109,6 +119,50 @@ no trace."
   "True when the graph wants a SID input — i.e. the weights hold more than one voice."
   (and (find "sid" (model-inputs (voice-model voice)) :key #'first :test #'string=) t))
 
+;;; ---- Kokoro ----------------------------------------------------------------
+;;;
+;;; A different graph with the same job: (tokens, style, speed) -> samples.  Tokens are the
+;;; espeak-style IPA characters looked up in the model's own vocab, each one an id with no pads
+;;; between them, a 0 at both ends; characters the vocab lacks are dropped, as kokoro-onnx does.
+;;; STYLE is a 256-vector chosen by how many tokens there are, from a table of 510 per voice,
+;;; exported once from the voices file as raw little-endian f32 (<name>.voices/<voice>.f32).
+
+(defun kokoro-style (voice name count)
+  (let ((path (merge-pathnames (concatenate 'string name ".f32") (voice-styles voice))))
+    (unless (probe-file path)
+      (error "kokoro: no voice ~s (looked for ~a)" name path))
+    (with-open-file (s path :element-type '(unsigned-byte 8))
+      (file-position s (* 1024 (min count 509)))
+      (let ((buf (make-array 1024 :element-type '(unsigned-byte 8))))
+        (read-sequence buf s)
+        (loop for i below 256
+              collect (let ((u (logior (aref buf (* 4 i)) (ash (aref buf (+ 1 (* 4 i))) 8)
+                                       (ash (aref buf (+ 2 (* 4 i))) 16)
+                                       (ash (aref buf (+ 3 (* 4 i))) 24))))
+                        (sb-kernel:make-single-float (if (logbitp 31 u) (- u (ash 1 32)) u))))))))
+
+(defun kokoro-synthesize (voice phonemes speaker length-scale)
+  (let* ((text (etypecase phonemes
+                 (string phonemes)
+                 (list (format nil "~{~a~}" phonemes))))
+         (vocab (voice-id-map voice))
+         (ids (loop for c across text
+                    for id = (gethash (string c) vocab)
+                    when id collect (if (vectorp id) (aref id 0) id)))
+         (ids (subseq ids 0 (min (length ids) 510)))
+         (n (length ids))
+         (name (if (stringp speaker) speaker (voice-style-name voice)))
+         (all (append (list 0) ids (list 0)))
+         (vals (run-model (voice-model voice)
+                          (list (cons "tokens" (tensor-from-list :i64 (vector 1 (length all)) all))
+                                (cons "style" (tensor-from-list :f32 (vector 1 256)
+                                                                (kokoro-style voice name n)))
+                                (cons "speed" (tensor-from-list
+                                               :f32 (vector 1)
+                                               (list (/ 1.0 (or length-scale 1.0))))))))
+         (out (model-output-tensor (voice-model voice) vals)))
+    (values (tensor-data out) (voice-sample-rate voice))))
+
 (defun synthesize (voice phonemes &key noise-scale length-scale noise-w (speaker 0))
   "Audio for PHONEMES as a single-float vector in [-1, 1], plus the sample rate.
 The three scales default to the voice's own; passing 0 for the two noise scales
@@ -117,6 +171,8 @@ makes the run deterministic, which is what the fixtures were dumped with.
 SPEAKER selects among the voices in a multi-speaker model — LibriTTS carries 904 of
 them in one graph, which is the difference between a corpus you may redistribute and
 one you may not.  A single-speaker graph declares no SID input and ignores it."
+  (when (voice-styles voice)
+    (return-from synthesize (kokoro-synthesize voice phonemes speaker length-scale)))
   (let* ((ids (phoneme-ids voice phonemes))
          (lengths (tensor-from-list :i64 (vector 1) (list (tensor-dim ids 1))))
          (scales (tensor-from-list
